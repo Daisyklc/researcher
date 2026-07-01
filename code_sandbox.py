@@ -69,6 +69,40 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一位顶级的 Kaggle Grandmaster 兼 Python
 """
 
 
+# =============================================================================
+# 参考项目挖掘: 意图识别 Prompt (要求严格输出 JSON)
+# =============================================================================
+_INTENT_PROMPT = """你是一位资深的机器学习竞赛研究员。
+请阅读下面的【研究报告(Markdown)】(以及可选的策略蓝图), 提炼出这份研究的核心意图,
+并给出可用于在 GitHub 上检索【相似/可参考开源项目】的搜索线索。
+
+只输出一个合法的 JSON 对象, 不要输出任何解释文字, 不要使用 Markdown 代码块围栏。
+JSON 结构必须严格如下:
+{{
+  "task_summary": "一句话概括这份研究要解决的核心任务",
+  "domain": "所属领域, 例如 tabular-classification / cv / nlp / time-series",
+  "frameworks": ["涉及或推荐的框架, 如 pytorch, sklearn, lightgbm"],
+  "keywords": ["3-6 个核心技术关键词"],
+  "github_queries": ["2-4 条精炼的 GitHub 仓库搜索语句, 英文, 每条尽量短且高命中"]
+}}
+"""
+
+# =============================================================================
+# 参考项目挖掘: 设计对齐 Prompt
+# =============================================================================
+_ALIGN_PROMPT = """你是一位资深的算法架构师。
+下面给出【本项目的研究意图】以及【若干个已拉取到本地的开源参考项目】(含 README 摘要与目录结构)。
+请对齐分析: 每个参考项目在【设计思路 / 数据处理 / 模型结构 / 工程实践】上有哪些值得本项目借鉴的点,
+以及哪些点不适用或需要注意的坑。
+
+请输出结构化的 Markdown 报告, 面向工程落地, 简洁务实。对每个参考项目给出:
+- 一句话定位
+- 3-5 条【可直接参考/借鉴】的点(越具体越好, 指出对应文件或模块更佳)
+- 1-2 条【需注意/不适用】的点
+最后给出一段【对本项目的整合建议】, 说明应优先采纳哪些设计。
+"""
+
+
 class CodeSandbox:
     """代码生成与多端(本地 Mac / 远程服务器)执行沙盒。"""
 
@@ -98,6 +132,7 @@ class CodeSandbox:
         self.src_dir = self.workspace_path / "src"
         self.logs_dir = self.workspace_path / "logs"
         self.data_dir = self.workspace_path / "data"
+        self.references_dir = self.workspace_path / "references"
 
         # ---- 校验外接硬盘挂载点是否存在 (SSD 未插时给出明确报错) ----
         mount_root = Path("/Volumes")
@@ -107,7 +142,7 @@ class CodeSandbox:
             )
 
         # ---- 确保工作区子目录存在 ----
-        for d in (self.src_dir, self.logs_dir, self.data_dir):
+        for d in (self.src_dir, self.logs_dir, self.data_dir, self.references_dir):
             try:
                 d.mkdir(parents=True, exist_ok=True)
             except OSError as exc:
@@ -130,7 +165,8 @@ class CodeSandbox:
         logger.info("CodeSandbox 初始化完成 | 工作区: %s", self.workspace_path)
         logger.info("  ├─ src : %s", self.src_dir)
         logger.info("  ├─ logs: %s", self.logs_dir)
-        logger.info("  └─ data: %s", self.data_dir)
+        logger.info("  ├─ data: %s", self.data_dir)
+        logger.info("  └─ references: %s", self.references_dir)
         logger.info("  远程算力: %s", "已配置" if self.ssh_config else "未配置(仅本地)")
 
     # ------------------------------------------------------------------ #
@@ -223,6 +259,331 @@ class CodeSandbox:
 
         logger.info("[生成] 脚本已保存: %s (%d 字符)", script_path, len(code))
         return str(script_path)
+
+    # ================================================================== #
+    #  参考项目挖掘管线 (意图识别 -> 搜索 -> 拉取 -> 设计对齐)
+    #  同样遵循【单步执行】: 出错即停, 不做任何自动修复重试。
+    # ================================================================== #
+
+    # ---- 1) 意图识别 ----
+    def recognize_intent(
+        self, research_md_path: str, blueprint_path: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        读取研究报告 (可选蓝图), 调用 DeepSeek 做意图识别, 返回结构化意图字典。
+
+        返回示例:
+          {"task_summary", "domain", "frameworks", "keywords", "github_queries"}
+        """
+        logger.info("[意图] 读取研究报告: %s", research_md_path)
+        try:
+            with open(research_md_path, "r", encoding="utf-8") as f:
+                research_md = f.read()
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(f"研究报告不存在: {research_md_path}") from exc
+
+        blueprint_ctx = ""
+        if blueprint_path and os.path.isfile(blueprint_path):
+            try:
+                with open(blueprint_path, "r", encoding="utf-8") as f:
+                    blueprint_ctx = "\n\n== 策略蓝图(可选参考) ==\n" + f.read()
+            except OSError:
+                pass
+
+        user_prompt = (
+            "== 研究报告(Markdown) ==\n" + research_md + blueprint_ctx +
+            "\n\n请据此输出意图识别 JSON。"
+        )
+
+        logger.info("[意图] 调用 DeepSeek 进行意图识别 ...")
+        client = self._get_client()
+        try:
+            resp = client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": _INTENT_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.1,
+                stream=False,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"DeepSeek 意图识别调用失败: {exc}") from exc
+
+        raw = self._strip_code_fence(resp.choices[0].message.content or "")
+        try:
+            intent = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"意图识别返回非法 JSON: {exc}\n原始返回:\n{raw[:500]}") from exc
+
+        if not intent.get("github_queries"):
+            raise RuntimeError("意图识别未产出任何 github_queries, 无法继续搜索。")
+
+        logger.info("[意图] task_summary: %s", intent.get("task_summary"))
+        logger.info("[意图] domain=%s | frameworks=%s", intent.get("domain"), intent.get("frameworks"))
+        logger.info("[意图] github_queries=%s", intent.get("github_queries"))
+
+        # 落盘意图, 便于人工审阅
+        try:
+            with open(self.references_dir / "intent.json", "w", encoding="utf-8") as f:
+                json.dump(intent, f, ensure_ascii=False, indent=2)
+        except OSError as exc:
+            logger.warning("意图 JSON 落盘失败: %s", exc)
+        return intent
+
+    # ---- 2) 搜索合适的开源项目 ----
+    def search_projects(self, intent: Dict[str, Any], max_repos: int = 3) -> list:
+        """
+        依据意图中的 github_queries, 使用 gh CLI 搜索仓库, 按 star 排序去重取 top-N。
+
+        返回: [{"full_name", "url", "stars", "description", "query"}...]
+        依赖已认证的 gh CLI; 未安装/未登录时抛出 RuntimeError。
+        """
+        if not self._has_command("gh"):
+            raise RuntimeError("未检测到 gh CLI, 无法搜索项目。请安装并 `gh auth login`。")
+
+        queries = intent.get("github_queries", [])
+        seen = set()
+        candidates: list = []
+
+        for q in queries:
+            logger.info("[搜索] gh search repos: %s", q)
+            try:
+                proc = subprocess.run(
+                    [
+                        "gh", "search", "repos", q,
+                        "--limit", "10",
+                        "--sort", "stars",
+                        "--json", "fullName,url,stargazersCount,description",
+                    ],
+                    capture_output=True, text=True, timeout=60,
+                )
+            except subprocess.TimeoutExpired:
+                logger.warning("[搜索] 查询超时, 跳过: %s", q)
+                continue
+            if proc.returncode != 0:
+                logger.warning("[搜索] gh 返回错误 (%s), 跳过: %s", proc.stderr.strip()[:200], q)
+                continue
+            try:
+                rows = json.loads(proc.stdout or "[]")
+            except json.JSONDecodeError:
+                continue
+            for r in rows:
+                name = r.get("fullName")
+                if not name or name in seen:
+                    continue
+                seen.add(name)
+                candidates.append({
+                    "full_name": name,
+                    "url": r.get("url"),
+                    "stars": r.get("stargazersCount", 0),
+                    "description": r.get("description") or "",
+                    "query": q,
+                })
+
+        if not candidates:
+            raise RuntimeError("未搜索到任何候选项目, 请检查网络/gh 登录或调整意图关键词。")
+
+        candidates.sort(key=lambda x: x["stars"], reverse=True)
+        top = candidates[:max_repos]
+        logger.info("[搜索] 命中 %d 个候选, 选取 top-%d:", len(candidates), len(top))
+        for c in top:
+            logger.info("  * %s (★%d) %s", c["full_name"], c["stars"], c["url"])
+        return top
+
+    # ---- 3) 拉取项目代码到工作区 ----
+    def fetch_project_code(self, repos: list, clone_timeout: int = 300) -> list:
+        """
+        将候选仓库浅克隆 (--depth 1) 到 references/<repo>。已存在则跳过重复克隆。
+        返回带 local_path 的仓库列表 (克隆失败的条目 local_path=None)。
+        """
+        if not self._has_command("git"):
+            raise RuntimeError("未检测到 git, 无法拉取项目代码。")
+
+        fetched = []
+        for repo in repos:
+            name = repo["full_name"]
+            safe_dir = name.replace("/", "__")
+            dest = self.references_dir / safe_dir
+            entry = dict(repo)
+
+            if dest.exists() and any(dest.iterdir()):
+                logger.info("[拉取] 已存在, 跳过: %s", dest)
+                entry["local_path"] = str(dest)
+                fetched.append(entry)
+                continue
+
+            logger.info("[拉取] git clone --depth 1 %s -> %s", repo["url"], dest)
+            try:
+                proc = subprocess.run(
+                    ["git", "clone", "--depth", "1", repo["url"], str(dest)],
+                    capture_output=True, text=True, timeout=clone_timeout,
+                )
+                if proc.returncode == 0:
+                    entry["local_path"] = str(dest)
+                    logger.info("[拉取] 完成: %s", name)
+                else:
+                    entry["local_path"] = None
+                    logger.error("[拉取] 失败(%s): %s", name, proc.stderr.strip()[:200])
+            except subprocess.TimeoutExpired:
+                entry["local_path"] = None
+                logger.error("[拉取] 超时(%ss), 跳过: %s", clone_timeout, name)
+            fetched.append(entry)
+
+        return fetched
+
+    # ---- 4) 设计对齐, 输出可参考点报告 ----
+    def align_references(self, research_md_path: str, repos: list) -> str:
+        """
+        汇总每个已拉取项目的 README 摘要 + 目录结构, 调用 DeepSeek 产出对齐报告。
+        报告保存到 references/reference_report.md, 返回其绝对路径。
+        """
+        valid = [r for r in repos if r.get("local_path")]
+        if not valid:
+            raise RuntimeError("没有可用的已拉取项目, 无法进行设计对齐。")
+
+        try:
+            with open(research_md_path, "r", encoding="utf-8") as f:
+                research_md = f.read()
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(f"研究报告不存在: {research_md_path}") from exc
+
+        blocks = []
+        for r in valid:
+            readme = self._read_readme(r["local_path"])
+            tree = self._list_tree(r["local_path"], max_entries=40)
+            blocks.append(
+                f"### 参考项目: {r['full_name']} (★{r.get('stars', 0)})\n"
+                f"- URL: {r.get('url')}\n"
+                f"- 描述: {r.get('description')}\n"
+                f"- 目录结构(节选):\n{tree}\n"
+                f"- README(节选):\n{readme[:3000]}\n"
+            )
+
+        user_prompt = (
+            "== 本项目研究意图(Markdown) ==\n" + research_md[:4000] +
+            "\n\n== 已拉取的参考项目 ==\n" + "\n\n".join(blocks) +
+            "\n\n请输出设计对齐与可参考点的 Markdown 报告。"
+        )
+
+        logger.info("[对齐] 调用 DeepSeek 生成设计对齐报告 ...")
+        client = self._get_client()
+        try:
+            resp = client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": _ALIGN_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.3,
+                stream=False,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"DeepSeek 设计对齐调用失败: {exc}") from exc
+
+        report = resp.choices[0].message.content or ""
+        report_path = self.references_dir / "reference_report.md"
+        header = (
+            "# 参考项目设计对齐报告\n\n"
+            f"> 生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"> 参考项目数: {len(valid)}\n\n"
+        )
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(header + report + "\n")
+
+        logger.info("[对齐] 报告已保存: %s", report_path)
+        return str(report_path)
+
+    # ---- 主控: 一键完成参考项目挖掘 ----
+    def discover_references(
+        self,
+        research_md_path: str,
+        blueprint_path: Optional[str] = None,
+        max_repos: int = 3,
+    ) -> Dict[str, Any]:
+        """
+        参考项目挖掘主控管线 (单步、出错即停):
+          1. recognize_intent  意图识别
+          2. search_projects   搜索合适项目
+          3. fetch_project_code 拉取代码到 references/
+          4. align_references  对齐设计并产出可参考点报告
+        返回汇总字典。
+        """
+        logger.info("########## 参考项目挖掘管线启动 ##########")
+        try:
+            intent = self.recognize_intent(research_md_path, blueprint_path)
+        except Exception as exc:
+            logger.error("意图识别阶段失败, 管线终止: %s", exc)
+            return {"status": "FAILED", "stage": "recognize_intent", "error": str(exc)}
+
+        try:
+            repos = self.search_projects(intent, max_repos=max_repos)
+        except Exception as exc:
+            logger.error("项目搜索阶段失败, 管线终止: %s", exc)
+            return {"status": "FAILED", "stage": "search_projects", "error": str(exc), "intent": intent}
+
+        try:
+            fetched = self.fetch_project_code(repos)
+        except Exception as exc:
+            logger.error("代码拉取阶段失败, 管线终止: %s", exc)
+            return {"status": "FAILED", "stage": "fetch_project_code", "error": str(exc), "repos": repos}
+
+        try:
+            report_path = self.align_references(research_md_path, fetched)
+        except Exception as exc:
+            logger.error("设计对齐阶段失败, 管线终止: %s", exc)
+            return {"status": "FAILED", "stage": "align_references", "error": str(exc), "repos": fetched}
+
+        result = {
+            "status": "SUCCESS",
+            "intent": intent,
+            "repos": fetched,
+            "report_path": report_path,
+            "references_dir": str(self.references_dir),
+        }
+        logger.info("########## 参考项目挖掘完成: 报告 -> %s ##########", report_path)
+        return result
+
+    # ---- 参考挖掘用到的小工具 ----
+    @staticmethod
+    def _has_command(cmd: str) -> bool:
+        from shutil import which
+        return which(cmd) is not None
+
+    @staticmethod
+    def _read_readme(repo_dir: str) -> str:
+        """读取仓库根目录的 README(大小写/后缀不敏感), 找不到返回占位串。"""
+        p = Path(repo_dir)
+        for item in p.iterdir():
+            if item.is_file() and item.name.lower().startswith("readme"):
+                try:
+                    return item.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    break
+        return "(该仓库未找到可读的 README)"
+
+    @staticmethod
+    def _list_tree(repo_dir: str, max_entries: int = 40) -> str:
+        """列出仓库主要文件结构(忽略 .git 等), 截断到 max_entries 条。"""
+        p = Path(repo_dir)
+        ignore = {".git", "__pycache__", ".github", "node_modules", ".idea"}
+        lines = []
+        count = 0
+        for root, dirs, files in os.walk(p):
+            dirs[:] = [d for d in dirs if d not in ignore]
+            rel_root = os.path.relpath(root, p)
+            depth = 0 if rel_root == "." else rel_root.count(os.sep) + 1
+            if depth > 2:  # 只看前 3 层, 避免报告过长
+                dirs[:] = []
+                continue
+            for name in sorted(files):
+                rel = os.path.normpath(os.path.join(rel_root, name))
+                lines.append(f"  {rel}")
+                count += 1
+                if count >= max_entries:
+                    lines.append("  ... (更多文件省略)")
+                    return "\n".join(lines)
+        return "\n".join(lines) if lines else "  (空)"
 
     # ------------------------------------------------------------------ #
     # 2) 本地执行 (Mac / MPS)
@@ -608,6 +969,15 @@ if __name__ == "__main__":
     blueprint = os.path.join(WORKSPACE, "blueprint.json")
     research = os.path.join(WORKSPACE, "research_report.md")
 
+    # ---- 功能A: 参考项目挖掘 (意图识别 -> 搜索 -> 拉取 -> 设计对齐) ----
+    refs = sandbox.discover_references(research, blueprint, max_repos=3)
+    print("\n参考项目挖掘结果:")
+    print(json.dumps(
+        {k: v for k, v in refs.items() if k != "intent"},
+        ensure_ascii=False, indent=2,
+    ))
+
+    # ---- 功能B: 生成并执行实验 ----
     final = sandbox.run_experiment(blueprint, research)
     print("\n最终执行状态:")
     print(json.dumps(final, ensure_ascii=False, indent=2))
