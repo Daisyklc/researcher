@@ -1,0 +1,39 @@
+{
+  "competition": "titanic",
+  "task_type": "binary_classification",
+  "target_hardware": "local_mac",
+  "objective": {
+    "target_column": "Survived",
+    "id_column": "PassengerId",
+    "metric": "accuracy"
+  },
+  "data": {
+    "train_file": "train.csv",
+    "test_file": "test.csv",
+    "sample_submission": "gender_submission.csv"
+  },
+  "strategy": {
+    "framework": "sklearn",
+    "model": "GradientBoostingClassifier",
+    "cross_validation": {
+      "scheme": "StratifiedKFold",
+      "n_splits": 5,
+      "shuffle": true,
+      "random_state": 42
+    },
+    "feature_engineering": [
+      "从 Name 中提取 Title(称谓) 并归并稀有类别",
+      "FamilySize = SibSp + Parch + 1, 以及 IsAlone 标志",
+      "Age / Fare 缺失值用中位数填补, 并做分箱",
+      "Sex / Embarked / Title 做 one-hot 编码",
+      "Cabin 首字母作为 Deck 特征, 缺失记为 Unknown"
+    ]
+  },
+  "output": {
+    "submission_file": "submission.csv"
+  },
+  "constraints": {
+    "max_memory_gb": 12,
+    "notes": "16G 统一内存 Mac, 控制内存占用避免 OOM; sklearn 任务无需 MPS"
+  }
+}
