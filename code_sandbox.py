@@ -10,8 +10,8 @@ code_sandbox.py
     - 绝对不含任何 while True / 递归 来自动修复 Bug, 保持直接的手动控制感。
 
 运行约束:
-    - 16G 统一内存 Mac, PyTorch 走 MPS 加速。
-    - 所有代码 / 数据 / 日志强制读写于外接硬盘 /Volumes/MySSD/Kaggle_Agent/ 下。
+    - 工作区路径可配置, 代码 / 数据 / 日志统一落盘于 workspace 目录下。
+    - 本地执行支持任意平台 (Linux / macOS / Windows); PyTorch 自动选择 CUDA / MPS / CPU。
     - 大模型使用 DeepSeek API (通过 openai SDK 调用)。
 """
 
@@ -59,13 +59,21 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一位顶级的 Kaggle Grandmaster 兼 Python
 必须严格遵守以下硬性约束 (违反任意一条都视为失败):
 1. 只输出一份【完整的、可直接运行的】Python 脚本, 不要输出任何解释性文字、
    不要使用 Markdown 代码块围栏 (```), 第一行起就是可执行的 Python 代码。
-2. 所有数据读取路径必须【硬编码】指向外接硬盘的数据目录:
+2. 所有数据读取路径必须【硬编码】指向工作区数据目录:
        DATA_DIR = "{data_dir}"
    例如 pd.read_csv(os.path.join(DATA_DIR, "train.csv"))。
-3. 如果使用 PyTorch, 必须包含 Mac 硬件加速判定, 并把模型与张量放到该 device 上:
-       device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+3. 如果使用 PyTorch, 必须自动选择可用加速设备 (优先级: CUDA > MPS > CPU),
+   并把模型与张量放到该 device 上, 例如:
+       def _select_device():
+           import torch
+           if torch.cuda.is_available():
+               return torch.device("cuda")
+           if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+               return torch.device("mps")
+           return torch.device("cpu")
+       device = _select_device()
 4. 脚本必须自包含: 包含全部 import、数据加载、训练/推理、以及最终结果的清晰打印 (print)。
-5. 注意运行环境为 16G 统一内存的 Mac, 请控制 batch_size / 内存占用, 避免 OOM。
+5. 请根据蓝图中的资源约束合理控制 batch_size / 内存占用, 避免 OOM。{memory_hint}
 """
 
 
@@ -104,7 +112,7 @@ _ALIGN_PROMPT = """你是一位资深的算法架构师。
 
 
 class CodeSandbox:
-    """代码生成与多端(本地 Mac / 远程服务器)执行沙盒。"""
+    """代码生成与多端(本地 / 远程服务器)执行沙盒。"""
 
     # DeepSeek API 默认端点
     _DEEPSEEK_BASE_URL = "https://api.deepseek.com"
@@ -120,7 +128,7 @@ class CodeSandbox:
         参数
         ----
         workspace_path : str
-            外接硬盘工作区根目录, 例如 /Volumes/MySSD/Kaggle_Agent/
+            工作区根目录, 例如 ./kaggle_agent_workspace 或 /data/kaggle_agent/
         ssh_config : dict, 可选
             远程算力路由配置, 需包含: host, user, port, key_filepath。
         deepseek_api_key : str, 可选
@@ -134,20 +142,13 @@ class CodeSandbox:
         self.data_dir = self.workspace_path / "data"
         self.references_dir = self.workspace_path / "references"
 
-        # ---- 校验外接硬盘挂载点是否存在 (SSD 未插时给出明确报错) ----
-        mount_root = Path("/Volumes")
-        if str(self.workspace_path).startswith("/Volumes") and not mount_root.exists():
-            raise RuntimeError(
-                "未检测到 /Volumes 挂载点, 外接硬盘可能未连接。请先插入 SSD 再运行。"
-            )
-
         # ---- 确保工作区子目录存在 ----
         for d in (self.src_dir, self.logs_dir, self.data_dir, self.references_dir):
             try:
                 d.mkdir(parents=True, exist_ok=True)
             except OSError as exc:
                 raise RuntimeError(
-                    f"无法创建工作区目录 {d} (外接硬盘是否已挂载并可写?): {exc}"
+                    f"无法创建工作区目录 {d} (请检查路径是否存在且可写): {exc}"
                 ) from exc
 
         # ---- SSH 配置 ----
@@ -183,6 +184,35 @@ class CodeSandbox:
         if self._client is None:
             self._client = OpenAI(api_key=self._api_key, base_url=self._DEEPSEEK_BASE_URL)
         return self._client
+
+    @staticmethod
+    def _build_memory_hint(blueprint: Dict[str, Any]) -> str:
+        """从蓝图 constraints 字段提取资源约束提示, 供代码生成 Prompt 使用。"""
+        constraints = blueprint.get("constraints") or {}
+        parts = []
+        if constraints.get("max_memory_gb"):
+            parts.append(f"可用内存约 {constraints['max_memory_gb']} GB")
+        if constraints.get("max_gpu_memory_gb"):
+            parts.append(f"GPU 显存约 {constraints['max_gpu_memory_gb']} GB")
+        if constraints.get("notes"):
+            parts.append(str(constraints["notes"]))
+        return " ".join(parts) if parts else "按常见单机环境保守估计资源占用。"
+
+    @staticmethod
+    def _normalize_target_hardware(target_hardware: str) -> str:
+        """将 target_hardware 规范为 local / remote_server, 兼容旧值 local_mac。"""
+        aliases = {
+            "local_mac": "local",
+            "local": "local",
+            "remote_server": "remote_server",
+        }
+        normalized = aliases.get(target_hardware)
+        if normalized is None:
+            raise ValueError(
+                f"未知的 target_hardware 取值: {target_hardware} "
+                "(应为 local / remote_server, 兼容旧值 local_mac)"
+            )
+        return normalized
 
     @staticmethod
     def _strip_code_fence(text: str) -> str:
@@ -224,7 +254,11 @@ class CodeSandbox:
         except FileNotFoundError as exc:
             raise FileNotFoundError(f"文献报告不存在: {research_md_path}") from exc
 
-        system_prompt = _SYSTEM_PROMPT_TEMPLATE.format(data_dir=str(self.data_dir))
+        memory_hint = self._build_memory_hint(blueprint)
+        system_prompt = _SYSTEM_PROMPT_TEMPLATE.format(
+            data_dir=str(self.data_dir),
+            memory_hint=memory_hint,
+        )
         user_prompt = (
             "== 策略蓝图 (blueprint.json) ==\n"
             f"{json.dumps(blueprint, ensure_ascii=False, indent=2)}\n\n"
@@ -586,7 +620,7 @@ class CodeSandbox:
         return "\n".join(lines) if lines else "  (空)"
 
     # ------------------------------------------------------------------ #
-    # 2) 本地执行 (Mac / MPS)
+    # 2) 本地执行
     # ------------------------------------------------------------------ #
     def execute_local(self, script_path: str, timeout_seconds: int = 3600) -> Dict[str, Any]:
         """
@@ -599,7 +633,7 @@ class CodeSandbox:
         script_path = str(Path(script_path).resolve())
 
         logger.info("=" * 60)
-        logger.info(">>> 路由走向: 【本地 Mac 执行】 (LOCAL / MPS)")
+        logger.info(">>> 路由走向: 【本地执行】 (LOCAL)")
         logger.info(">>> 脚本: %s", script_path)
         logger.info(">>> 超时: %ss | 日志: %s", timeout_seconds, log_path)
         logger.info("=" * 60)
@@ -919,7 +953,12 @@ class CodeSandbox:
         try:
             with open(blueprint_path, "r", encoding="utf-8") as f:
                 blueprint = json.load(f)
-            target_hardware = blueprint.get("target_hardware", "local_mac")
+            target_hardware = self._normalize_target_hardware(
+                blueprint.get("target_hardware", "local")
+            )
+        except ValueError as exc:
+            logger.error("蓝图 target_hardware 无效: %s", exc)
+            return {"status": "FAILED", "stage": "parse_blueprint", "error": str(exc)}
         except Exception as exc:
             logger.error("蓝图 target_hardware 解析失败: %s", exc)
             return {"status": "FAILED", "stage": "parse_blueprint", "error": str(exc)}
@@ -927,7 +966,7 @@ class CodeSandbox:
         logger.info("目标硬件路由: target_hardware = %s", target_hardware)
 
         # Step 3: 路由分发
-        if target_hardware == "local_mac":
+        if target_hardware == "local":
             result = self.execute_local(script_path)
         elif target_hardware == "remote_server":
             if not self.ssh_config:
@@ -936,7 +975,7 @@ class CodeSandbox:
                 return {"status": "FAILED", "stage": "route", "error": msg, "script_path": script_path}
             result = self.execute_remote(script_path)
         else:
-            msg = f"未知的 target_hardware 取值: {target_hardware} (应为 local_mac / remote_server)"
+            msg = f"未知的 target_hardware 取值: {target_hardware} (应为 local / remote_server)"
             logger.error(msg)
             return {"status": "FAILED", "stage": "route", "error": msg, "script_path": script_path}
 
@@ -950,7 +989,10 @@ class CodeSandbox:
 # 使用示例 (直接运行本文件时的最小演示)
 # =============================================================================
 if __name__ == "__main__":
-    WORKSPACE = "/Volumes/MySSD/Kaggle_Agent/"
+    WORKSPACE = os.environ.get(
+        "KAGGLE_AGENT_WORKSPACE",
+        str(Path(__file__).resolve().parent / "kaggle_agent_workspace"),
+    )
 
     # 远程算力(可选): 不需要远程时置为 None
     SSH_CONFIG = {

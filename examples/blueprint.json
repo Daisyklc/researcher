@@ -1,7 +1,7 @@
 {
   "competition": "titanic",
   "task_type": "binary_classification",
-  "target_hardware": "local_mac",
+  "target_hardware": "local",
   "objective": {
     "target_column": "Survived",
     "id_column": "PassengerId",
@@ -33,7 +33,7 @@
     "submission_file": "submission.csv"
   },
   "constraints": {
-    "max_memory_gb": 12,
-    "notes": "16G 统一内存 Mac, 控制内存占用避免 OOM; sklearn 任务无需 MPS"
+    "max_memory_gb": 16,
+    "notes": "按单机环境控制内存占用避免 OOM; sklearn 任务无需 GPU"
   }
 }

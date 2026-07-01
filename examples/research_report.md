@@ -26,7 +26,7 @@ Titanic 是经典的二分类入门竞赛，目标是根据乘客的属性（舱
 - **进阶（非本次 baseline 范围）**：XGBoost/LightGBM + 特征交叉，或简单 stacking。
 
 ## 5. 对生成代码的硬性要求
-1. 数据从外接硬盘 `data/` 目录读取（`train.csv` / `test.csv`）。
+1. 数据从工作区 `data/` 目录读取（`train.csv` / `test.csv`）。
 2. 完成上述特征工程与缺失值填补。
 3. 用 5 折分层交叉验证输出 OOF accuracy，并在全量训练后对测试集预测。
 4. 生成 `submission.csv`（列：`PassengerId`, `Survived`），保存到工作区根目录。
