@@ -5,7 +5,7 @@ code_sandbox.py
 项目分析 Agent 的核心执行引擎: CodeSandbox
 
 主链路 (run_analysis_pipeline):
-    需求表格/文档 → 截图识别 → 寻找项目 → 加载代码 → 闭环整理 → 输出行动报告 .md
+    需求表格/文档 → 截图视觉识别 → 寻找项目 → 加载代码 → 闭环整理 → 输出行动报告 .md
 
 设计哲学 —— “绝对服从的单步执行器”:
     - 每个阶段只执行一次, 出错即停, 不做自动修复重试。
@@ -18,6 +18,7 @@ import json
 import time
 import shlex
 import signal
+import base64
 import logging
 import subprocess
 from pathlib import Path
@@ -38,11 +39,6 @@ try:
     from PIL import Image
 except ImportError:  # pragma: no cover
     Image = None
-
-try:
-    import pytesseract
-except ImportError:  # pragma: no cover
-    pytesseract = None
 
 try:
     from duckduckgo_search import DDGS
@@ -147,6 +143,29 @@ _ACTION_REPORT_PROMPT = """你是一位技术文档工程师。
 
 要求: 内容具体、可执行, 路径写全, 不要空泛套话。"""
 
+# =============================================================================
+# 项目分析管线: 需求表格截图视觉识别 Prompt
+# =============================================================================
+_VISION_REQUIREMENT_PROMPT = """你是一位需求分析助手。用户提供了一张【需求表格/需求说明】截图。
+请仔细识别图中的所有文字、表格、手写批注与流程标注, 输出为清晰的 Markdown 需求文档。
+
+必须遵守:
+1. 保留表格字段名与对应内容, 用 Markdown 表格或列表呈现
+2. 识别并保留手写文字、旁注、箭头附近的说明
+3. 若图中有流程关系, 用有序列表或章节结构化描述
+4. 只输出需求文档正文, 不要加「好的」「以下是」等解释性开场白
+5. 看不清的内容用 [无法识别] 标注, 不要编造"""
+
+_IMAGE_MIME_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".bmp": "image/bmp",
+    ".tiff": "image/tiff",
+}
+
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".gif"}
 _TEXT_EXTENSIONS = {".md", ".txt", ".csv", ".rst"}
 _DEPENDENCY_FILENAMES = (
@@ -173,6 +192,7 @@ class CodeSandbox:
         ssh_config: Optional[Dict[str, Any]] = None,
         deepseek_api_key: Optional[str] = None,
         model: str = "deepseek-chat",
+        vision_model: Optional[str] = None,
     ):
         """
         参数
@@ -184,7 +204,10 @@ class CodeSandbox:
         deepseek_api_key : str, 可选
             DeepSeek API Key。缺省时读取环境变量 DEEPSEEK_API_KEY。
         model : str
-            生成代码使用的模型, "deepseek-chat" 或 "deepseek-coder"。
+            文本任务使用的模型, 如 deepseek-chat / deepseek-coder。
+        vision_model : str, 可选
+            截图视觉识别使用的多模态模型。缺省读取环境变量 DEEPSEEK_VISION_MODEL,
+            再缺省为 deepseek-chat (勿用 deepseek-reasoner, 其不支持视觉)。
         """
         self.workspace_path = Path(workspace_path).resolve()
         self.src_dir = self.workspace_path / "src"
@@ -211,6 +234,7 @@ class CodeSandbox:
         # ---- DeepSeek 客户端 (惰性构造, 避免无 Key 时直接崩) ----
         self._api_key = deepseek_api_key or os.getenv("DEEPSEEK_API_KEY")
         self.model = model
+        self.vision_model = vision_model or os.getenv("DEEPSEEK_VISION_MODEL", "deepseek-chat")
         self._client: Optional["OpenAI"] = None
 
         logger.info("CodeSandbox 初始化完成 | 工作区: %s", self.workspace_path)
@@ -219,6 +243,7 @@ class CodeSandbox:
         logger.info("  ├─ data: %s", self.data_dir)
         logger.info("  ├─ references: %s", self.references_dir)
         logger.info("  └─ reports: %s", self.reports_dir)
+        logger.info("  文本模型: %s | 视觉模型: %s", self.model, self.vision_model)
         logger.info("  远程算力: %s", "已配置" if self.ssh_config else "未配置(仅本地)")
 
     # ------------------------------------------------------------------ #
@@ -267,13 +292,60 @@ class CodeSandbox:
             raise RuntimeError(f"DeepSeek API 调用失败: {exc}") from exc
         return (resp.choices[0].message.content or "").strip()
 
+    def _encode_image_data_url(self, image_path: Path) -> str:
+        """将图片编码为 data URL, 供多模态 API 使用。"""
+        mime = _IMAGE_MIME_TYPES.get(image_path.suffix.lower(), "image/png")
+        if Image is not None:
+            try:
+                with Image.open(image_path) as img:
+                    fmt = (img.format or "PNG").upper()
+                    mime = Image.MIME.get(fmt, mime)
+            except Exception:
+                pass
+        encoded = base64.standard_b64encode(image_path.read_bytes()).decode("ascii")
+        return f"data:{mime};base64,{encoded}"
+
+    def _call_vision_llm(
+        self,
+        system_prompt: str,
+        image_data_url: str,
+        user_text: str = "请识别这张需求表格截图, 并按系统要求输出 Markdown 需求文档。",
+        temperature: float = 0.1,
+    ) -> str:
+        """调用多模态视觉模型 (OpenAI 兼容 image_url 格式)。"""
+        if self.vision_model == "deepseek-reasoner":
+            raise RuntimeError("deepseek-reasoner 不支持视觉输入, 请改用 deepseek-chat 或 deepseek-v4-flash。")
+
+        client = self._get_client()
+        try:
+            resp = client.chat.completions.create(
+                model=self.vision_model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": user_text},
+                            {"type": "image_url", "image_url": {"url": image_data_url}},
+                        ],
+                    },
+                ],
+                temperature=temperature,
+                stream=False,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"视觉模型 API 调用失败 (model={self.vision_model}): {exc}"
+            ) from exc
+        return (resp.choices[0].message.content or "").strip()
+
     # ================================================================== #
     #  项目分析管线: 需求解析 → 找项目 → 加载代码 → 报告
     # ================================================================== #
 
     def parse_requirement(self, requirement_path: str) -> Dict[str, Any]:
         """
-        解析需求输入: 支持图片(OCR)或文本/JSON/CSV 文件。
+        解析需求输入: 支持图片(多模态视觉模型)或文本/JSON/CSV 文件。
 
         返回: {"source_path", "source_type", "text"}
         """
@@ -283,8 +355,8 @@ class CodeSandbox:
 
         suffix = path.suffix.lower()
         if suffix in _IMAGE_EXTENSIONS:
-            text = self._ocr_image(path)
-            source_type = "image_ocr"
+            text = self._parse_requirement_image(path)
+            source_type = "image_vision"
         elif suffix in _TEXT_EXTENSIONS or suffix == "":
             text = path.read_text(encoding="utf-8", errors="replace")
             source_type = "text"
@@ -308,21 +380,14 @@ class CodeSandbox:
         logger.info("[需求] 已解析 (%s): %d 字符 -> %s", source_type, len(text), parsed_path)
         return {"source_path": str(path), "source_type": source_type, "text": text}
 
-    def _ocr_image(self, image_path: Path) -> str:
-        """对需求表格截图执行 OCR。"""
-        if Image is None or pytesseract is None:
-            raise RuntimeError(
-                "图片识别需要安装 Pillow 与 pytesseract, 且系统需安装 tesseract 二进制。"
-                " 也可改用 .md / .txt 文本需求文件。"
-            )
-        if not self._has_command("tesseract"):
-            raise RuntimeError(
-                "未检测到 tesseract 可执行文件。请安装 tesseract, 或改用文本需求文件。"
-            )
-        image = Image.open(image_path)
-        text = pytesseract.image_to_string(image, lang="chi_sim+eng")
-        if not text.strip():
-            raise ValueError(f"OCR 未识别到有效文字: {image_path}")
+    def _parse_requirement_image(self, image_path: Path) -> str:
+        """使用多模态视觉模型识别需求表格截图。"""
+        logger.info("[需求] 调用视觉模型识别截图: %s (model=%s)", image_path, self.vision_model)
+        data_url = self._encode_image_data_url(image_path)
+        text = self._call_vision_llm(_VISION_REQUIREMENT_PROMPT, data_url)
+        text = self._strip_code_fence(text).strip()
+        if not text:
+            raise ValueError(f"视觉模型未返回有效需求文本: {image_path}")
         return text
 
     def recognize_intent_from_text(
@@ -688,7 +753,7 @@ class CodeSandbox:
     ) -> Dict[str, Any]:
         """
         项目分析主控管线 (单步、出错即停):
-          1. parse_requirement      需求表格/文档/截图识别
+          1. parse_requirement      需求表格/文档/截图视觉识别
           2. recognize_intent       意图识别
           3. find_project           寻找项目 (开源/闭源)
           4. load_project_code      加载当前代码
