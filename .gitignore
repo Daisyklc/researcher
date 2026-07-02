@@ -1,0 +1,11 @@
+# 本地密钥配置(含 api_key), 请勿提交到仓库
+config.json
+
+# Python
+__pycache__/
+*.pyc
+
+# 挖掘产物
+references/
+analysis_*.md
+SUMMARY.md

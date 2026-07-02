@@ -1,2 +1,11 @@
+# 核心 LLM 客户端 (意图识别 / 子 Agent 分析 / 总结)
 openai>=1.30.0
-paramiko>=3.4.0
+
+# 发现搜索: browser-use 驱动 Chromium 联网检索开源/闭源项目
+# 安装后需执行: playwright install chromium
+browser-use>=0.1.40
+pydantic>=2.5.0
+
+# 闭源产品主页抓取 + 结构化抽取
+# 安装后需执行: playwright install chromium
+crawl4ai>=0.4.0
