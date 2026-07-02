@@ -22,7 +22,8 @@ import base64
 import logging
 import subprocess
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, List, Tuple
 
 # ---- 第三方依赖 (延迟/防御式导入) ----
 try:
@@ -178,11 +179,54 @@ _ENTRY_CANDIDATES = (
     "index.js", "index.ts", "main.go", "lib.rs",
 )
 
+# =============================================================================
+# 多模型提供商与动态降级配置
+# =============================================================================
+@dataclass(frozen=True)
+class ModelEndpoint:
+    provider: str
+    model: str
+    base_url: str
+    api_key: str
+
+    @property
+    def label(self) -> str:
+        return f"{self.provider}/{self.model}"
+
+
+_PROVIDER_REGISTRY: Dict[str, Dict[str, Any]] = {
+    "deepseek": {
+        "base_url": "https://api.deepseek.com",
+        "api_key_env": "DEEPSEEK_API_KEY",
+        "default_text": "deepseek-chat",
+        "default_vision": "deepseek-chat",
+    },
+    "qwen": {
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "base_url_env": "DASHSCOPE_BASE_URL",
+        "api_key_env": "DASHSCOPE_API_KEY",
+        "default_text": "qwen-plus",
+        "default_vision": "qwen-vl-plus",
+    },
+}
+
+_NO_VISION_MODELS = {"deepseek-reasoner", "qwen-max", "qwen-plus", "qwen-turbo", "qwen-long"}
+_DEFAULT_TEXT_FALLBACK = (
+    "deepseek/deepseek-chat",
+    "qwen/qwen-plus",
+    "qwen/qwen-turbo",
+)
+_DEFAULT_VISION_FALLBACK = (
+    "deepseek/deepseek-chat",
+    "qwen/qwen-vl-plus",
+    "qwen/qwen3-vl-plus",
+    "qwen/qwen2-vl-7b-instruct",
+)
+
 
 class CodeSandbox:
     """项目分析 + 代码执行沙盒 (主链路: 需求 → 项目理解 → 行动报告)。"""
 
-    _DEEPSEEK_BASE_URL = "https://api.deepseek.com"
     _MAX_KEY_FILE_BYTES = 12_000
     _MAX_KEY_FILES = 8
 
@@ -191,8 +235,12 @@ class CodeSandbox:
         workspace_path: str,
         ssh_config: Optional[Dict[str, Any]] = None,
         deepseek_api_key: Optional[str] = None,
+        dashscope_api_key: Optional[str] = None,
         model: str = "deepseek-chat",
         vision_model: Optional[str] = None,
+        text_fallback_chain: Optional[List[str]] = None,
+        vision_fallback_chain: Optional[List[str]] = None,
+        enable_model_fallback: bool = True,
     ):
         """
         参数
@@ -202,12 +250,19 @@ class CodeSandbox:
         ssh_config : dict, 可选
             远程算力路由配置, 需包含: host, user, port, key_filepath。
         deepseek_api_key : str, 可选
-            DeepSeek API Key。缺省时读取环境变量 DEEPSEEK_API_KEY。
+            DeepSeek API Key。缺省读取 DEEPSEEK_API_KEY。
+        dashscope_api_key : str, 可选
+            通义千问 DashScope API Key。缺省读取 DASHSCOPE_API_KEY。
         model : str
-            文本任务使用的模型, 如 deepseek-chat / deepseek-coder。
+            文本主模型, 支持 `deepseek-chat` 或 `qwen/qwen-plus` 格式。
         vision_model : str, 可选
-            截图视觉识别使用的多模态模型。缺省读取环境变量 DEEPSEEK_VISION_MODEL,
-            再缺省为 deepseek-chat (勿用 deepseek-reasoner, 其不支持视觉)。
+            视觉主模型, 缺省读取 DEEPSEEK_VISION_MODEL 或 qwen/qwen-vl-plus。
+        text_fallback_chain : list, 可选
+            文本任务降级链, 如 ["deepseek/deepseek-chat", "qwen/qwen-plus"]。
+        vision_fallback_chain : list, 可选
+            视觉任务降级链, 如 ["deepseek/deepseek-chat", "qwen/qwen-vl-plus"]。
+        enable_model_fallback : bool
+            是否在主模型失败时自动降级到备用模型。
         """
         self.workspace_path = Path(workspace_path).resolve()
         self.src_dir = self.workspace_path / "src"
@@ -231,11 +286,24 @@ class CodeSandbox:
             if missing:
                 logger.warning("ssh_config 缺少字段: %s, 远程执行可能失败。", missing)
 
-        # ---- DeepSeek 客户端 (惰性构造, 避免无 Key 时直接崩) ----
-        self._api_key = deepseek_api_key or os.getenv("DEEPSEEK_API_KEY")
-        self.model = model
-        self.vision_model = vision_model or os.getenv("DEEPSEEK_VISION_MODEL", "deepseek-chat")
-        self._client: Optional["OpenAI"] = None
+        # ---- 多模型 API 配置 ----
+        self._deepseek_api_key = deepseek_api_key or os.getenv("DEEPSEEK_API_KEY")
+        self._dashscope_api_key = dashscope_api_key or os.getenv("DASHSCOPE_API_KEY")
+        self.model = self._normalize_model_ref(model)[1]
+        self._text_primary_ref = self._normalize_model_ref(model)
+        default_vision = vision_model or os.getenv("DEEPSEEK_VISION_MODEL") or os.getenv("QWEN_VISION_MODEL")
+        if not default_vision:
+            default_vision = (
+                "qwen/qwen-vl-plus" if self._dashscope_api_key and not self._deepseek_api_key
+                else "deepseek-chat"
+            )
+        self._vision_primary_ref = self._normalize_model_ref(default_vision)
+        self.vision_model = self._vision_primary_ref[1]
+        self.text_fallback_chain = text_fallback_chain
+        self.vision_fallback_chain = vision_fallback_chain
+        self.enable_model_fallback = enable_model_fallback
+        self._clients: Dict[str, "OpenAI"] = {}
+        self._last_llm_usage: Dict[str, Any] = {}
 
         logger.info("CodeSandbox 初始化完成 | 工作区: %s", self.workspace_path)
         logger.info("  ├─ src : %s", self.src_dir)
@@ -243,54 +311,270 @@ class CodeSandbox:
         logger.info("  ├─ data: %s", self.data_dir)
         logger.info("  ├─ references: %s", self.references_dir)
         logger.info("  └─ reports: %s", self.reports_dir)
-        logger.info("  文本模型: %s | 视觉模型: %s", self.model, self.vision_model)
+        logger.info(
+            "  文本模型: %s/%s | 视觉模型: %s/%s | 动态降级: %s",
+            self._text_primary_ref[0], self.model,
+            self._vision_primary_ref[0], self.vision_model,
+            "开启" if self.enable_model_fallback else "关闭",
+        )
+        logger.info("  已配置 Key: deepseek=%s qwen=%s",
+                    "是" if self._deepseek_api_key else "否",
+                    "是" if self._dashscope_api_key else "否")
         logger.info("  远程算力: %s", "已配置" if self.ssh_config else "未配置(仅本地)")
+
+    # ------------------------------------------------------------------ #
+    # 多模型路由与动态降级
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _normalize_model_ref(model_ref: str) -> Tuple[str, str]:
+        """解析模型引用, 支持 provider/model 或按名称自动推断。"""
+        ref = (model_ref or "").strip()
+        if not ref:
+            return "deepseek", "deepseek-chat"
+        if "/" in ref:
+            provider, model = ref.split("/", 1)
+            return provider.lower(), model
+        lower = ref.lower()
+        if lower.startswith("qwen"):
+            return "qwen", ref
+        return "deepseek", ref
+
+    def _provider_base_url(self, provider: str) -> str:
+        cfg = _PROVIDER_REGISTRY[provider]
+        if provider == "qwen":
+            return os.getenv(cfg.get("base_url_env", ""), cfg["base_url"])
+        return cfg["base_url"]
+
+    def _provider_api_key(self, provider: str) -> Optional[str]:
+        if provider == "deepseek":
+            return self._deepseek_api_key
+        if provider == "qwen":
+            return self._dashscope_api_key
+        env_name = _PROVIDER_REGISTRY.get(provider, {}).get("api_key_env")
+        return os.getenv(env_name) if env_name else None
+
+    def _resolve_endpoint(self, model_ref: str) -> Optional[ModelEndpoint]:
+        provider, model = self._normalize_model_ref(model_ref)
+        if provider not in _PROVIDER_REGISTRY:
+            logger.warning("未知模型提供商: %s", provider)
+            return None
+        api_key = self._provider_api_key(provider)
+        if not api_key:
+            return None
+        return ModelEndpoint(
+            provider=provider,
+            model=model,
+            base_url=self._provider_base_url(provider),
+            api_key=api_key,
+        )
+
+    @staticmethod
+    def _is_vision_capable(endpoint: ModelEndpoint) -> bool:
+        if endpoint.model in _NO_VISION_MODELS:
+            return False
+        if endpoint.provider == "qwen":
+            return "vl" in endpoint.model.lower()
+        if endpoint.provider == "deepseek":
+            return endpoint.model != "deepseek-reasoner"
+        return False
+
+    def _parse_chain_from_env(self, env_name: str) -> List[str]:
+        raw = os.getenv(env_name, "").strip()
+        if not raw:
+            return []
+        return [item.strip() for item in raw.split(",") if item.strip()]
+
+    def _build_fallback_chain(self, task: str) -> List[ModelEndpoint]:
+        if task == "vision":
+            refs = (
+                self.vision_fallback_chain
+                or self._parse_chain_from_env("LLM_VISION_FALLBACK_CHAIN")
+                or list(_DEFAULT_VISION_FALLBACK)
+            )
+            primary_ref = f"{self._vision_primary_ref[0]}/{self._vision_primary_ref[1]}"
+        else:
+            refs = (
+                self.text_fallback_chain
+                or self._parse_chain_from_env("LLM_TEXT_FALLBACK_CHAIN")
+                or list(_DEFAULT_TEXT_FALLBACK)
+            )
+            primary_ref = f"{self._text_primary_ref[0]}/{self._text_primary_ref[1]}"
+
+        ordered_refs: List[str] = []
+        for ref in [primary_ref, *refs]:
+            if ref not in ordered_refs:
+                ordered_refs.append(ref)
+
+        endpoints: List[ModelEndpoint] = []
+        for ref in ordered_refs:
+            endpoint = self._resolve_endpoint(ref)
+            if endpoint is None:
+                continue
+            if task == "vision" and not self._is_vision_capable(endpoint):
+                continue
+            if endpoint.label not in {e.label for e in endpoints}:
+                endpoints.append(endpoint)
+        return endpoints
+
+    def _get_client_for(self, endpoint: ModelEndpoint) -> "OpenAI":
+        if OpenAI is None:
+            raise RuntimeError("未安装 openai 库, 请执行: pip install openai")
+        cache_key = f"{endpoint.provider}|{endpoint.base_url}|{endpoint.api_key[:6]}"
+        if cache_key not in self._clients:
+            self._clients[cache_key] = OpenAI(
+                api_key=endpoint.api_key,
+                base_url=endpoint.base_url,
+            )
+        return self._clients[cache_key]
+
+    def _get_client(self) -> "OpenAI":
+        """兼容旧接口: 返回文本主模型对应客户端。"""
+        chain = self._build_fallback_chain("text")
+        if not chain:
+            raise RuntimeError(
+                "未配置可用 API Key。请设置 DEEPSEEK_API_KEY 和/或 DASHSCOPE_API_KEY。"
+            )
+        return self._get_client_for(chain[0])
+
+    def _record_llm_usage(self, task: str, endpoint: ModelEndpoint, attempts: List[str]) -> None:
+        usage = {
+            "task": task,
+            "provider": endpoint.provider,
+            "model": endpoint.model,
+            "label": endpoint.label,
+            "attempts": attempts,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        self._last_llm_usage[task] = usage
+        log_path = self.reports_dir / "llm_usage.json"
+        try:
+            history: Dict[str, Any] = {}
+            if log_path.exists():
+                history = json.loads(log_path.read_text(encoding="utf-8"))
+            history[task] = usage
+            log_path.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError as exc:
+            logger.warning("LLM 使用记录落盘失败: %s", exc)
+
+    def _chat_completion(
+        self,
+        endpoint: ModelEndpoint,
+        messages: List[Dict[str, Any]],
+        temperature: float,
+    ) -> str:
+        client = self._get_client_for(endpoint)
+        resp = client.chat.completions.create(
+            model=endpoint.model,
+            messages=messages,
+            temperature=temperature,
+            stream=False,
+        )
+        content = (resp.choices[0].message.content or "").strip()
+        if not content:
+            raise RuntimeError(f"模型返回空内容: {endpoint.label}")
+        return content
+
+    def _call_with_fallback(
+        self,
+        task: str,
+        messages: List[Dict[str, Any]],
+        temperature: float = 0.2,
+    ) -> str:
+        chain = self._build_fallback_chain(task)
+        if not chain:
+            raise RuntimeError(
+                f"没有可用的{task}模型端点。请配置 DEEPSEEK_API_KEY 和/或 DASHSCOPE_API_KEY。"
+            )
+
+        attempts: List[str] = []
+        errors: List[str] = []
+        targets = chain if self.enable_model_fallback else chain[:1]
+
+        for endpoint in targets:
+            attempts.append(endpoint.label)
+            try:
+                logger.info("[%s] 尝试模型: %s", task, endpoint.label)
+                content = self._chat_completion(endpoint, messages, temperature)
+                if len(targets) > 1 and endpoint.label != targets[0].label:
+                    logger.warning("[%s] 主模型不可用, 已降级至: %s", task, endpoint.label)
+                self._record_llm_usage(task, endpoint, attempts)
+                return content
+            except Exception as exc:
+                err = f"{endpoint.label}: {exc}"
+                errors.append(err)
+                logger.warning("[%s] 模型调用失败, 准备降级: %s", task, err)
+
+        raise RuntimeError(
+            f"所有{task}模型均调用失败:\n" + "\n".join(errors)
+        )
+
+    def _call_llm(self, system_prompt: str, user_prompt: str, temperature: float = 0.2) -> str:
+        """统一文本 LLM 调用 (支持 DeepSeek / 千问动态降级)。"""
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        return self._call_with_fallback("text", messages, temperature)
+
+    def _call_vision_llm(
+        self,
+        system_prompt: str,
+        image_data_url: str,
+        user_text: str = "请识别这张需求表格截图, 并按系统要求输出 Markdown 需求文档。",
+        temperature: float = 0.1,
+    ) -> str:
+        """调用多模态视觉模型 (支持 DeepSeek / 千问动态降级)。"""
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_text},
+                    {"type": "image_url", "image_url": {"url": image_data_url}},
+                ],
+            },
+        ]
+        try:
+            return self._call_with_fallback("vision", messages, temperature)
+        except RuntimeError:
+            raise
+
+    def _ocr_fallback_image(self, image_path: Path) -> str:
+        """视觉模型全部失败时的最后兜底: 本地 OCR (可选)。"""
+        try:
+            import pytesseract  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError(
+                "视觉模型均不可用, 且未安装 pytesseract 作为 OCR 兜底。"
+            ) from exc
+        if Image is None:
+            raise RuntimeError("OCR 兜底需要 Pillow。")
+        if not self._has_command("tesseract"):
+            raise RuntimeError("OCR 兜底需要系统安装 tesseract。")
+        text = pytesseract.image_to_string(Image.open(image_path), lang="chi_sim+eng").strip()
+        if not text:
+            raise ValueError(f"OCR 兜底未识别到有效文字: {image_path}")
+        self._record_llm_usage(
+            "vision",
+            ModelEndpoint("local", "tesseract-ocr", "local", "n/a"),
+            ["vision_chain_failed", "local/tesseract-ocr"],
+        )
+        return text
 
     # ------------------------------------------------------------------ #
     # 内部工具
     # ------------------------------------------------------------------ #
-    def _get_client(self) -> "OpenAI":
-        """惰性构造 DeepSeek(openai 兼容) 客户端。"""
-        if OpenAI is None:
-            raise RuntimeError("未安装 openai 库, 请执行: pip install openai")
-        if not self._api_key:
-            raise RuntimeError(
-                "缺少 DeepSeek API Key, 请设置环境变量 DEEPSEEK_API_KEY 或在构造时传入。"
-            )
-        if self._client is None:
-            self._client = OpenAI(api_key=self._api_key, base_url=self._DEEPSEEK_BASE_URL)
-        return self._client
-
     @staticmethod
     def _strip_code_fence(text: str) -> str:
         """兜底: 若模型仍返回了 Markdown 代码块围栏, 剥离之。"""
         text = text.strip()
         if text.startswith("```"):
             lines = text.splitlines()
-            # 去掉首行 ```python / ```
             lines = lines[1:]
-            # 去掉末行 ```
             if lines and lines[-1].strip().startswith("```"):
                 lines = lines[:-1]
             text = "\n".join(lines)
         return text.strip() + "\n"
-
-    def _call_llm(self, system_prompt: str, user_prompt: str, temperature: float = 0.2) -> str:
-        """统一 LLM 调用入口。"""
-        client = self._get_client()
-        try:
-            resp = client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=temperature,
-                stream=False,
-            )
-        except Exception as exc:
-            raise RuntimeError(f"DeepSeek API 调用失败: {exc}") from exc
-        return (resp.choices[0].message.content or "").strip()
 
     def _encode_image_data_url(self, image_path: Path) -> str:
         """将图片编码为 data URL, 供多模态 API 使用。"""
@@ -304,40 +588,6 @@ class CodeSandbox:
                 pass
         encoded = base64.standard_b64encode(image_path.read_bytes()).decode("ascii")
         return f"data:{mime};base64,{encoded}"
-
-    def _call_vision_llm(
-        self,
-        system_prompt: str,
-        image_data_url: str,
-        user_text: str = "请识别这张需求表格截图, 并按系统要求输出 Markdown 需求文档。",
-        temperature: float = 0.1,
-    ) -> str:
-        """调用多模态视觉模型 (OpenAI 兼容 image_url 格式)。"""
-        if self.vision_model == "deepseek-reasoner":
-            raise RuntimeError("deepseek-reasoner 不支持视觉输入, 请改用 deepseek-chat 或 deepseek-v4-flash。")
-
-        client = self._get_client()
-        try:
-            resp = client.chat.completions.create(
-                model=self.vision_model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": user_text},
-                            {"type": "image_url", "image_url": {"url": image_data_url}},
-                        ],
-                    },
-                ],
-                temperature=temperature,
-                stream=False,
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                f"视觉模型 API 调用失败 (model={self.vision_model}): {exc}"
-            ) from exc
-        return (resp.choices[0].message.content or "").strip()
 
     # ================================================================== #
     #  项目分析管线: 需求解析 → 找项目 → 加载代码 → 报告
@@ -355,8 +605,8 @@ class CodeSandbox:
 
         suffix = path.suffix.lower()
         if suffix in _IMAGE_EXTENSIONS:
-            text = self._parse_requirement_image(path)
-            source_type = "image_vision"
+            text, image_source = self._parse_requirement_image(path)
+            source_type = image_source
         elif suffix in _TEXT_EXTENSIONS or suffix == "":
             text = path.read_text(encoding="utf-8", errors="replace")
             source_type = "text"
@@ -380,15 +630,21 @@ class CodeSandbox:
         logger.info("[需求] 已解析 (%s): %d 字符 -> %s", source_type, len(text), parsed_path)
         return {"source_path": str(path), "source_type": source_type, "text": text}
 
-    def _parse_requirement_image(self, image_path: Path) -> str:
-        """使用多模态视觉模型识别需求表格截图。"""
-        logger.info("[需求] 调用视觉模型识别截图: %s (model=%s)", image_path, self.vision_model)
+    def _parse_requirement_image(self, image_path: Path) -> Tuple[str, str]:
+        """使用多模态视觉模型识别需求表格截图, 失败时 OCR 兜底。"""
+        logger.info("[需求] 调用视觉模型识别截图: %s", image_path)
         data_url = self._encode_image_data_url(image_path)
-        text = self._call_vision_llm(_VISION_REQUIREMENT_PROMPT, data_url)
+        try:
+            text = self._call_vision_llm(_VISION_REQUIREMENT_PROMPT, data_url)
+            source_type = "image_vision"
+        except RuntimeError as exc:
+            logger.warning("[需求] 视觉模型链全部失败, 尝试 OCR 兜底: %s", exc)
+            text = self._ocr_fallback_image(image_path)
+            source_type = "image_ocr_fallback"
         text = self._strip_code_fence(text).strip()
         if not text:
-            raise ValueError(f"视觉模型未返回有效需求文本: {image_path}")
-        return text
+            raise ValueError(f"未能从截图提取有效需求文本: {image_path}")
+        return text, source_type
 
     def recognize_intent_from_text(
         self,
@@ -843,6 +1099,7 @@ class CodeSandbox:
             "refined_context_path": str(self.reports_dir / "refined_context.md"),
             "stage_prompt_path": str(self.reports_dir / "stage_prompt.txt"),
             "report_path": report_path,
+            "llm_usage": dict(self._last_llm_usage),
         }
         logger.info("########## 项目分析完成: %s ##########", report_path)
         return result
@@ -873,7 +1130,6 @@ class CodeSandbox:
         except FileNotFoundError as exc:
             raise FileNotFoundError(f"文献报告不存在: {research_md_path}") from exc
 
-        system_prompt = _SYSTEM_PROMPT_TEMPLATE.format(data_dir=str(self.data_dir))
         user_prompt = (
             "== 策略蓝图 (blueprint.json) ==\n"
             f"{json.dumps(blueprint, ensure_ascii=False, indent=2)}\n\n"
@@ -882,25 +1138,16 @@ class CodeSandbox:
             "请据此生成完整可运行的 Python 实验脚本。"
         )
 
-        logger.info("[生成] 调用 DeepSeek 模型: %s ...", self.model)
-        client = self._get_client()
-        try:
-            resp = client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
+        logger.info("[生成] 调用文本模型链 (主模型: %s/%s) ...", self._text_primary_ref[0], self.model)
+        code = self._strip_code_fence(
+            self._call_llm(
+                _SYSTEM_PROMPT_TEMPLATE.format(data_dir=str(self.data_dir)),
+                user_prompt,
                 temperature=0.2,
-                stream=False,
             )
-        except Exception as exc:  # openai 各类网络/鉴权异常统一兜底
-            raise RuntimeError(f"DeepSeek API 调用失败: {exc}") from exc
-
-        code = resp.choices[0].message.content or ""
-        code = self._strip_code_fence(code)
+        )
         if not code.strip():
-            raise RuntimeError("DeepSeek 返回空代码, 请检查蓝图/报告内容或 API 配额。")
+            raise RuntimeError("模型返回空代码, 请检查蓝图/报告内容或 API 配额。")
 
         script_path = self.src_dir / "baseline_v1.py"
         with open(script_path, "w", encoding="utf-8") as f:
@@ -1067,22 +1314,8 @@ class CodeSandbox:
             "\n\n请输出设计对齐与可参考点的 Markdown 报告。"
         )
 
-        logger.info("[对齐] 调用 DeepSeek 生成设计对齐报告 ...")
-        client = self._get_client()
-        try:
-            resp = client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": _ALIGN_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.3,
-                stream=False,
-            )
-        except Exception as exc:
-            raise RuntimeError(f"DeepSeek 设计对齐调用失败: {exc}") from exc
-
-        report = resp.choices[0].message.content or ""
+        logger.info("[对齐] 调用文本模型链生成设计对齐报告 ...")
+        report = self._call_llm(_ALIGN_PROMPT, user_prompt, temperature=0.3)
         report_path = self.references_dir / "reference_report.md"
         header = (
             "# 参考项目设计对齐报告\n\n"
