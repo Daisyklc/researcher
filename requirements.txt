@@ -1,2 +1,7 @@
 openai>=1.30.0
 paramiko>=3.4.0
+Pillow>=10.0.0
+duckduckgo-search>=6.0.0
+
+# 可选: 视觉模型链全部失败时启用 OCR 本地兜底 (还需系统安装 tesseract)
+# pytesseract>=0.3.10

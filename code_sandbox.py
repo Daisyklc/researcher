@@ -2,30 +2,30 @@
 """
 code_sandbox.py
 ================
-受控 Kaggle 竞赛 Agent 的核心执行引擎: CodeSandbox
+项目分析 Agent 的核心执行引擎: CodeSandbox
+
+主链路 (run_analysis_pipeline):
+    需求表格/文档 → 截图视觉识别 → 寻找项目 → 加载代码 → 闭环整理 → 输出行动报告 .md
 
 设计哲学 —— “绝对服从的单步执行器”:
-    - 只负责【生成代码】并【执行一次】。
-    - 代码报错时, 只负责【捕获日志】并【停止】。
-    - 绝对不含任何 while True / 递归 来自动修复 Bug, 保持直接的手动控制感。
-
-运行约束:
-    - 16G 统一内存 Mac, PyTorch 走 MPS 加速。
-    - 所有代码 / 数据 / 日志强制读写于外接硬盘 /Volumes/MySSD/Kaggle_Agent/ 下。
-    - 大模型使用 DeepSeek API (通过 openai SDK 调用)。
+    - 每个阶段只执行一次, 出错即停, 不做自动修复重试。
+    - 输出 .md 记录阅读路径、开源软件、网上讨论与项目逻辑, 供下一轮续接。
 """
 
 import os
+import re
 import json
 import time
 import shlex
 import signal
+import base64
 import logging
 import subprocess
 from pathlib import Path
-from typing import Optional, Dict, Any
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, List, Tuple
 
-# ---- 第三方依赖 (延迟/防御式导入, 保证纯本地流程即使缺 paramiko 也能跑) ----
+# ---- 第三方依赖 (延迟/防御式导入) ----
 try:
     from openai import OpenAI
 except ImportError:  # pragma: no cover
@@ -35,6 +35,16 @@ try:
     import paramiko
 except ImportError:  # pragma: no cover
     paramiko = None
+
+try:
+    from PIL import Image
+except ImportError:  # pragma: no cover
+    Image = None
+
+try:
+    from duckduckgo_search import DDGS
+except ImportError:  # pragma: no cover
+    DDGS = None
 
 
 # =============================================================================
@@ -72,18 +82,19 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一位顶级的 Kaggle Grandmaster 兼 Python
 # =============================================================================
 # 参考项目挖掘: 意图识别 Prompt (要求严格输出 JSON)
 # =============================================================================
-_INTENT_PROMPT = """你是一位资深的机器学习竞赛研究员。
-请阅读下面的【研究报告(Markdown)】(以及可选的策略蓝图), 提炼出这份研究的核心意图,
-并给出可用于在 GitHub 上检索【相似/可参考开源项目】的搜索线索。
+_INTENT_PROMPT = """你是一位资深的机器学习竞赛研究员与软件架构师。
+请阅读下面的【需求文档】(以及可选的补充材料), 提炼核心意图,
+并给出可用于检索【开源项目】与【网上讨论】的搜索线索。
 
 只输出一个合法的 JSON 对象, 不要输出任何解释文字, 不要使用 Markdown 代码块围栏。
 JSON 结构必须严格如下:
 {{
-  "task_summary": "一句话概括这份研究要解决的核心任务",
-  "domain": "所属领域, 例如 tabular-classification / cv / nlp / time-series",
-  "frameworks": ["涉及或推荐的框架, 如 pytorch, sklearn, lightgbm"],
+  "task_summary": "一句话概括要解决的核心任务",
+  "domain": "所属领域, 例如 tabular-classification / cv / nlp / web-backend",
+  "frameworks": ["涉及或可能用到的框架, 如 pytorch, sklearn, fastapi"],
   "keywords": ["3-6 个核心技术关键词"],
-  "github_queries": ["2-4 条精炼的 GitHub 仓库搜索语句, 英文, 每条尽量短且高命中"]
+  "github_queries": ["2-4 条精炼的 GitHub 仓库搜索语句, 英文, 每条尽量短且高命中"],
+  "search_queries": ["2-4 条用于检索网上正在讨论的相关话题的搜索语句, 中英文均可"]
 }}
 """
 
@@ -102,52 +113,170 @@ _ALIGN_PROMPT = """你是一位资深的算法架构师。
 最后给出一段【对本项目的整合建议】, 说明应优先采纳哪些设计。
 """
 
+# =============================================================================
+# 项目分析管线: 闭环整理 Prompt
+# =============================================================================
+_REFINE_CONTEXT_PROMPT = """你是一位资深的软件架构师。
+根据【需求文档】与【已加载的项目代码上下文】, 深入整理该项目的:
+- 整体业务流程与模块职责
+- 关键入口与核心调用链
+- 已阅读文件路径及其作用
+- 当前最值得继续深入阅读的文件
+
+输出结构化的 Markdown, 面向工程落地, 简洁务实。"""
+
+# =============================================================================
+# 项目分析管线: 行动报告 Prompt
+# =============================================================================
+_ACTION_REPORT_PROMPT = """你是一位技术文档工程师。
+请根据提供的全部上下文, 生成一份完整的【项目行动报告】Markdown。
+
+报告必须包含以下章节 (按顺序, 使用二级标题):
+## 需求摘要
+## 开源软件名称
+列出项目依赖的第三方库/框架/工具, 注明来源文件 (如 requirements.txt)。
+## 网上正在讨论的
+汇总与该项目/技术栈相关的外部讨论要点 (来自提供的搜索结果)。
+## 项目逻辑
+说明业务流程、模块划分、入口文件、关键调用链, 并列出【已阅读的路径】。
+## 当前阶段提示词
+给出一段可直接用于下一轮 Agent/人工继续深入的行动提示词 (可续接历史上下文)。
+
+要求: 内容具体、可执行, 路径写全, 不要空泛套话。"""
+
+# =============================================================================
+# 项目分析管线: 需求表格截图视觉识别 Prompt
+# =============================================================================
+_VISION_REQUIREMENT_PROMPT = """你是一位需求分析助手。用户提供了一张【需求表格/需求说明】截图。
+请仔细识别图中的所有文字、表格、手写批注与流程标注, 输出为清晰的 Markdown 需求文档。
+
+必须遵守:
+1. 保留表格字段名与对应内容, 用 Markdown 表格或列表呈现
+2. 识别并保留手写文字、旁注、箭头附近的说明
+3. 若图中有流程关系, 用有序列表或章节结构化描述
+4. 只输出需求文档正文, 不要加「好的」「以下是」等解释性开场白
+5. 看不清的内容用 [无法识别] 标注, 不要编造"""
+
+_IMAGE_MIME_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".bmp": "image/bmp",
+    ".tiff": "image/tiff",
+}
+
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".gif"}
+_TEXT_EXTENSIONS = {".md", ".txt", ".csv", ".rst"}
+_DEPENDENCY_FILENAMES = (
+    "requirements.txt", "requirements-dev.txt", "pyproject.toml",
+    "setup.py", "setup.cfg", "Pipfile", "environment.yml",
+    "package.json", "go.mod", "Cargo.toml",
+)
+_ENTRY_CANDIDATES = (
+    "main.py", "app.py", "run.py", "manage.py", "cli.py",
+    "index.js", "index.ts", "main.go", "lib.rs",
+)
+
+# =============================================================================
+# 多模型提供商与动态降级配置
+# =============================================================================
+@dataclass(frozen=True)
+class ModelEndpoint:
+    provider: str
+    model: str
+    base_url: str
+    api_key: str
+
+    @property
+    def label(self) -> str:
+        return f"{self.provider}/{self.model}"
+
+
+_PROVIDER_REGISTRY: Dict[str, Dict[str, Any]] = {
+    "deepseek": {
+        "base_url": "https://api.deepseek.com",
+        "api_key_env": "DEEPSEEK_API_KEY",
+        "default_text": "deepseek-chat",
+        "default_vision": "deepseek-chat",
+    },
+    "qwen": {
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "base_url_env": "DASHSCOPE_BASE_URL",
+        "api_key_env": "DASHSCOPE_API_KEY",
+        "default_text": "qwen-plus",
+        "default_vision": "qwen-vl-plus",
+    },
+}
+
+_NO_VISION_MODELS = {"deepseek-reasoner", "qwen-max", "qwen-plus", "qwen-turbo", "qwen-long"}
+_DEFAULT_TEXT_FALLBACK = (
+    "deepseek/deepseek-chat",
+    "qwen/qwen-plus",
+    "qwen/qwen-turbo",
+)
+_DEFAULT_VISION_FALLBACK = (
+    "deepseek/deepseek-chat",
+    "qwen/qwen-vl-plus",
+    "qwen/qwen3-vl-plus",
+    "qwen/qwen2-vl-7b-instruct",
+)
+
 
 class CodeSandbox:
-    """代码生成与多端(本地 Mac / 远程服务器)执行沙盒。"""
+    """项目分析 + 代码执行沙盒 (主链路: 需求 → 项目理解 → 行动报告)。"""
 
-    # DeepSeek API 默认端点
-    _DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+    _MAX_KEY_FILE_BYTES = 12_000
+    _MAX_KEY_FILES = 8
 
     def __init__(
         self,
         workspace_path: str,
         ssh_config: Optional[Dict[str, Any]] = None,
         deepseek_api_key: Optional[str] = None,
+        dashscope_api_key: Optional[str] = None,
         model: str = "deepseek-chat",
+        vision_model: Optional[str] = None,
+        text_fallback_chain: Optional[List[str]] = None,
+        vision_fallback_chain: Optional[List[str]] = None,
+        enable_model_fallback: bool = True,
     ):
         """
         参数
         ----
         workspace_path : str
-            外接硬盘工作区根目录, 例如 /Volumes/MySSD/Kaggle_Agent/
+            工作区根目录, 例如 ./kaggle_agent_workspace
         ssh_config : dict, 可选
             远程算力路由配置, 需包含: host, user, port, key_filepath。
         deepseek_api_key : str, 可选
-            DeepSeek API Key。缺省时读取环境变量 DEEPSEEK_API_KEY。
+            DeepSeek API Key。缺省读取 DEEPSEEK_API_KEY。
+        dashscope_api_key : str, 可选
+            通义千问 DashScope API Key。缺省读取 DASHSCOPE_API_KEY。
         model : str
-            生成代码使用的模型, "deepseek-chat" 或 "deepseek-coder"。
+            文本主模型, 支持 `deepseek-chat` 或 `qwen/qwen-plus` 格式。
+        vision_model : str, 可选
+            视觉主模型, 缺省读取 DEEPSEEK_VISION_MODEL 或 qwen/qwen-vl-plus。
+        text_fallback_chain : list, 可选
+            文本任务降级链, 如 ["deepseek/deepseek-chat", "qwen/qwen-plus"]。
+        vision_fallback_chain : list, 可选
+            视觉任务降级链, 如 ["deepseek/deepseek-chat", "qwen/qwen-vl-plus"]。
+        enable_model_fallback : bool
+            是否在主模型失败时自动降级到备用模型。
         """
         self.workspace_path = Path(workspace_path).resolve()
         self.src_dir = self.workspace_path / "src"
         self.logs_dir = self.workspace_path / "logs"
         self.data_dir = self.workspace_path / "data"
         self.references_dir = self.workspace_path / "references"
+        self.reports_dir = self.workspace_path / "reports"
 
-        # ---- 校验外接硬盘挂载点是否存在 (SSD 未插时给出明确报错) ----
-        mount_root = Path("/Volumes")
-        if str(self.workspace_path).startswith("/Volumes") and not mount_root.exists():
-            raise RuntimeError(
-                "未检测到 /Volumes 挂载点, 外接硬盘可能未连接。请先插入 SSD 再运行。"
-            )
-
-        # ---- 确保工作区子目录存在 ----
-        for d in (self.src_dir, self.logs_dir, self.data_dir, self.references_dir):
+        for d in (self.src_dir, self.logs_dir, self.data_dir, self.references_dir, self.reports_dir):
             try:
                 d.mkdir(parents=True, exist_ok=True)
             except OSError as exc:
                 raise RuntimeError(
-                    f"无法创建工作区目录 {d} (外接硬盘是否已挂载并可写?): {exc}"
+                    f"无法创建工作区目录 {d} (请检查路径是否存在且可写): {exc}"
                 ) from exc
 
         # ---- SSH 配置 ----
@@ -157,49 +286,826 @@ class CodeSandbox:
             if missing:
                 logger.warning("ssh_config 缺少字段: %s, 远程执行可能失败。", missing)
 
-        # ---- DeepSeek 客户端 (惰性构造, 避免无 Key 时直接崩) ----
-        self._api_key = deepseek_api_key or os.getenv("DEEPSEEK_API_KEY")
-        self.model = model
-        self._client: Optional["OpenAI"] = None
+        # ---- 多模型 API 配置 ----
+        self._deepseek_api_key = deepseek_api_key or os.getenv("DEEPSEEK_API_KEY")
+        self._dashscope_api_key = dashscope_api_key or os.getenv("DASHSCOPE_API_KEY")
+        self.model = self._normalize_model_ref(model)[1]
+        self._text_primary_ref = self._normalize_model_ref(model)
+        default_vision = vision_model or os.getenv("DEEPSEEK_VISION_MODEL") or os.getenv("QWEN_VISION_MODEL")
+        if not default_vision:
+            default_vision = (
+                "qwen/qwen-vl-plus" if self._dashscope_api_key and not self._deepseek_api_key
+                else "deepseek-chat"
+            )
+        self._vision_primary_ref = self._normalize_model_ref(default_vision)
+        self.vision_model = self._vision_primary_ref[1]
+        self.text_fallback_chain = text_fallback_chain
+        self.vision_fallback_chain = vision_fallback_chain
+        self.enable_model_fallback = enable_model_fallback
+        self._clients: Dict[str, "OpenAI"] = {}
+        self._last_llm_usage: Dict[str, Any] = {}
 
         logger.info("CodeSandbox 初始化完成 | 工作区: %s", self.workspace_path)
         logger.info("  ├─ src : %s", self.src_dir)
         logger.info("  ├─ logs: %s", self.logs_dir)
         logger.info("  ├─ data: %s", self.data_dir)
-        logger.info("  └─ references: %s", self.references_dir)
+        logger.info("  ├─ references: %s", self.references_dir)
+        logger.info("  └─ reports: %s", self.reports_dir)
+        logger.info(
+            "  文本模型: %s/%s | 视觉模型: %s/%s | 动态降级: %s",
+            self._text_primary_ref[0], self.model,
+            self._vision_primary_ref[0], self.vision_model,
+            "开启" if self.enable_model_fallback else "关闭",
+        )
+        logger.info("  已配置 Key: deepseek=%s qwen=%s",
+                    "是" if self._deepseek_api_key else "否",
+                    "是" if self._dashscope_api_key else "否")
         logger.info("  远程算力: %s", "已配置" if self.ssh_config else "未配置(仅本地)")
+
+    # ------------------------------------------------------------------ #
+    # 多模型路由与动态降级
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _normalize_model_ref(model_ref: str) -> Tuple[str, str]:
+        """解析模型引用, 支持 provider/model 或按名称自动推断。"""
+        ref = (model_ref or "").strip()
+        if not ref:
+            return "deepseek", "deepseek-chat"
+        if "/" in ref:
+            provider, model = ref.split("/", 1)
+            return provider.lower(), model
+        lower = ref.lower()
+        if lower.startswith("qwen"):
+            return "qwen", ref
+        return "deepseek", ref
+
+    def _provider_base_url(self, provider: str) -> str:
+        cfg = _PROVIDER_REGISTRY[provider]
+        if provider == "qwen":
+            return os.getenv(cfg.get("base_url_env", ""), cfg["base_url"])
+        return cfg["base_url"]
+
+    def _provider_api_key(self, provider: str) -> Optional[str]:
+        if provider == "deepseek":
+            return self._deepseek_api_key
+        if provider == "qwen":
+            return self._dashscope_api_key
+        env_name = _PROVIDER_REGISTRY.get(provider, {}).get("api_key_env")
+        return os.getenv(env_name) if env_name else None
+
+    def _resolve_endpoint(self, model_ref: str) -> Optional[ModelEndpoint]:
+        provider, model = self._normalize_model_ref(model_ref)
+        if provider not in _PROVIDER_REGISTRY:
+            logger.warning("未知模型提供商: %s", provider)
+            return None
+        api_key = self._provider_api_key(provider)
+        if not api_key:
+            return None
+        return ModelEndpoint(
+            provider=provider,
+            model=model,
+            base_url=self._provider_base_url(provider),
+            api_key=api_key,
+        )
+
+    @staticmethod
+    def _is_vision_capable(endpoint: ModelEndpoint) -> bool:
+        if endpoint.model in _NO_VISION_MODELS:
+            return False
+        if endpoint.provider == "qwen":
+            return "vl" in endpoint.model.lower()
+        if endpoint.provider == "deepseek":
+            return endpoint.model != "deepseek-reasoner"
+        return False
+
+    def _parse_chain_from_env(self, env_name: str) -> List[str]:
+        raw = os.getenv(env_name, "").strip()
+        if not raw:
+            return []
+        return [item.strip() for item in raw.split(",") if item.strip()]
+
+    def _build_fallback_chain(self, task: str) -> List[ModelEndpoint]:
+        if task == "vision":
+            refs = (
+                self.vision_fallback_chain
+                or self._parse_chain_from_env("LLM_VISION_FALLBACK_CHAIN")
+                or list(_DEFAULT_VISION_FALLBACK)
+            )
+            primary_ref = f"{self._vision_primary_ref[0]}/{self._vision_primary_ref[1]}"
+        else:
+            refs = (
+                self.text_fallback_chain
+                or self._parse_chain_from_env("LLM_TEXT_FALLBACK_CHAIN")
+                or list(_DEFAULT_TEXT_FALLBACK)
+            )
+            primary_ref = f"{self._text_primary_ref[0]}/{self._text_primary_ref[1]}"
+
+        ordered_refs: List[str] = []
+        for ref in [primary_ref, *refs]:
+            if ref not in ordered_refs:
+                ordered_refs.append(ref)
+
+        endpoints: List[ModelEndpoint] = []
+        for ref in ordered_refs:
+            endpoint = self._resolve_endpoint(ref)
+            if endpoint is None:
+                continue
+            if task == "vision" and not self._is_vision_capable(endpoint):
+                continue
+            if endpoint.label not in {e.label for e in endpoints}:
+                endpoints.append(endpoint)
+        return endpoints
+
+    def _get_client_for(self, endpoint: ModelEndpoint) -> "OpenAI":
+        if OpenAI is None:
+            raise RuntimeError("未安装 openai 库, 请执行: pip install openai")
+        cache_key = f"{endpoint.provider}|{endpoint.base_url}|{endpoint.api_key[:6]}"
+        if cache_key not in self._clients:
+            self._clients[cache_key] = OpenAI(
+                api_key=endpoint.api_key,
+                base_url=endpoint.base_url,
+            )
+        return self._clients[cache_key]
+
+    def _get_client(self) -> "OpenAI":
+        """兼容旧接口: 返回文本主模型对应客户端。"""
+        chain = self._build_fallback_chain("text")
+        if not chain:
+            raise RuntimeError(
+                "未配置可用 API Key。请设置 DEEPSEEK_API_KEY 和/或 DASHSCOPE_API_KEY。"
+            )
+        return self._get_client_for(chain[0])
+
+    def _record_llm_usage(self, task: str, endpoint: ModelEndpoint, attempts: List[str]) -> None:
+        usage = {
+            "task": task,
+            "provider": endpoint.provider,
+            "model": endpoint.model,
+            "label": endpoint.label,
+            "attempts": attempts,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        self._last_llm_usage[task] = usage
+        log_path = self.reports_dir / "llm_usage.json"
+        try:
+            history: Dict[str, Any] = {}
+            if log_path.exists():
+                history = json.loads(log_path.read_text(encoding="utf-8"))
+            history[task] = usage
+            log_path.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError as exc:
+            logger.warning("LLM 使用记录落盘失败: %s", exc)
+
+    def _chat_completion(
+        self,
+        endpoint: ModelEndpoint,
+        messages: List[Dict[str, Any]],
+        temperature: float,
+    ) -> str:
+        client = self._get_client_for(endpoint)
+        resp = client.chat.completions.create(
+            model=endpoint.model,
+            messages=messages,
+            temperature=temperature,
+            stream=False,
+        )
+        content = (resp.choices[0].message.content or "").strip()
+        if not content:
+            raise RuntimeError(f"模型返回空内容: {endpoint.label}")
+        return content
+
+    def _call_with_fallback(
+        self,
+        task: str,
+        messages: List[Dict[str, Any]],
+        temperature: float = 0.2,
+    ) -> str:
+        chain = self._build_fallback_chain(task)
+        if not chain:
+            raise RuntimeError(
+                f"没有可用的{task}模型端点。请配置 DEEPSEEK_API_KEY 和/或 DASHSCOPE_API_KEY。"
+            )
+
+        attempts: List[str] = []
+        errors: List[str] = []
+        targets = chain if self.enable_model_fallback else chain[:1]
+
+        for endpoint in targets:
+            attempts.append(endpoint.label)
+            try:
+                logger.info("[%s] 尝试模型: %s", task, endpoint.label)
+                content = self._chat_completion(endpoint, messages, temperature)
+                if len(targets) > 1 and endpoint.label != targets[0].label:
+                    logger.warning("[%s] 主模型不可用, 已降级至: %s", task, endpoint.label)
+                self._record_llm_usage(task, endpoint, attempts)
+                return content
+            except Exception as exc:
+                err = f"{endpoint.label}: {exc}"
+                errors.append(err)
+                logger.warning("[%s] 模型调用失败, 准备降级: %s", task, err)
+
+        raise RuntimeError(
+            f"所有{task}模型均调用失败:\n" + "\n".join(errors)
+        )
+
+    def _call_llm(self, system_prompt: str, user_prompt: str, temperature: float = 0.2) -> str:
+        """统一文本 LLM 调用 (支持 DeepSeek / 千问动态降级)。"""
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        return self._call_with_fallback("text", messages, temperature)
+
+    def _call_vision_llm(
+        self,
+        system_prompt: str,
+        image_data_url: str,
+        user_text: str = "请识别这张需求表格截图, 并按系统要求输出 Markdown 需求文档。",
+        temperature: float = 0.1,
+    ) -> str:
+        """调用多模态视觉模型 (支持 DeepSeek / 千问动态降级)。"""
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_text},
+                    {"type": "image_url", "image_url": {"url": image_data_url}},
+                ],
+            },
+        ]
+        try:
+            return self._call_with_fallback("vision", messages, temperature)
+        except RuntimeError:
+            raise
+
+    def _ocr_fallback_image(self, image_path: Path) -> str:
+        """视觉模型全部失败时的最后兜底: 本地 OCR (可选)。"""
+        try:
+            import pytesseract  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError(
+                "视觉模型均不可用, 且未安装 pytesseract 作为 OCR 兜底。"
+            ) from exc
+        if Image is None:
+            raise RuntimeError("OCR 兜底需要 Pillow。")
+        if not self._has_command("tesseract"):
+            raise RuntimeError("OCR 兜底需要系统安装 tesseract。")
+        text = pytesseract.image_to_string(Image.open(image_path), lang="chi_sim+eng").strip()
+        if not text:
+            raise ValueError(f"OCR 兜底未识别到有效文字: {image_path}")
+        self._record_llm_usage(
+            "vision",
+            ModelEndpoint("local", "tesseract-ocr", "local", "n/a"),
+            ["vision_chain_failed", "local/tesseract-ocr"],
+        )
+        return text
 
     # ------------------------------------------------------------------ #
     # 内部工具
     # ------------------------------------------------------------------ #
-    def _get_client(self) -> "OpenAI":
-        """惰性构造 DeepSeek(openai 兼容) 客户端。"""
-        if OpenAI is None:
-            raise RuntimeError("未安装 openai 库, 请执行: pip install openai")
-        if not self._api_key:
-            raise RuntimeError(
-                "缺少 DeepSeek API Key, 请设置环境变量 DEEPSEEK_API_KEY 或在构造时传入。"
-            )
-        if self._client is None:
-            self._client = OpenAI(api_key=self._api_key, base_url=self._DEEPSEEK_BASE_URL)
-        return self._client
-
     @staticmethod
     def _strip_code_fence(text: str) -> str:
         """兜底: 若模型仍返回了 Markdown 代码块围栏, 剥离之。"""
         text = text.strip()
         if text.startswith("```"):
             lines = text.splitlines()
-            # 去掉首行 ```python / ```
             lines = lines[1:]
-            # 去掉末行 ```
             if lines and lines[-1].strip().startswith("```"):
                 lines = lines[:-1]
             text = "\n".join(lines)
         return text.strip() + "\n"
 
+    def _encode_image_data_url(self, image_path: Path) -> str:
+        """将图片编码为 data URL, 供多模态 API 使用。"""
+        mime = _IMAGE_MIME_TYPES.get(image_path.suffix.lower(), "image/png")
+        if Image is not None:
+            try:
+                with Image.open(image_path) as img:
+                    fmt = (img.format or "PNG").upper()
+                    mime = Image.MIME.get(fmt, mime)
+            except Exception:
+                pass
+        encoded = base64.standard_b64encode(image_path.read_bytes()).decode("ascii")
+        return f"data:{mime};base64,{encoded}"
+
+    # ================================================================== #
+    #  项目分析管线: 需求解析 → 找项目 → 加载代码 → 报告
+    # ================================================================== #
+
+    def parse_requirement(self, requirement_path: str) -> Dict[str, Any]:
+        """
+        解析需求输入: 支持图片(多模态视觉模型)或文本/JSON/CSV 文件。
+
+        返回: {"source_path", "source_type", "text"}
+        """
+        path = Path(requirement_path).resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"需求文件不存在: {requirement_path}")
+
+        suffix = path.suffix.lower()
+        if suffix in _IMAGE_EXTENSIONS:
+            text, image_source = self._parse_requirement_image(path)
+            source_type = image_source
+        elif suffix in _TEXT_EXTENSIONS or suffix == "":
+            text = path.read_text(encoding="utf-8", errors="replace")
+            source_type = "text"
+        elif suffix == ".json":
+            raw = path.read_text(encoding="utf-8", errors="replace")
+            try:
+                text = json.dumps(json.loads(raw), ensure_ascii=False, indent=2)
+            except json.JSONDecodeError:
+                text = raw
+            source_type = "json"
+        else:
+            text = path.read_text(encoding="utf-8", errors="replace")
+            source_type = "text"
+
+        text = text.strip()
+        if not text:
+            raise ValueError(f"需求文件内容为空: {requirement_path}")
+
+        parsed_path = self.reports_dir / "requirement_parsed.txt"
+        parsed_path.write_text(text, encoding="utf-8")
+        logger.info("[需求] 已解析 (%s): %d 字符 -> %s", source_type, len(text), parsed_path)
+        return {"source_path": str(path), "source_type": source_type, "text": text}
+
+    def _parse_requirement_image(self, image_path: Path) -> Tuple[str, str]:
+        """使用多模态视觉模型识别需求表格截图, 失败时 OCR 兜底。"""
+        logger.info("[需求] 调用视觉模型识别截图: %s", image_path)
+        data_url = self._encode_image_data_url(image_path)
+        try:
+            text = self._call_vision_llm(_VISION_REQUIREMENT_PROMPT, data_url)
+            source_type = "image_vision"
+        except RuntimeError as exc:
+            logger.warning("[需求] 视觉模型链全部失败, 尝试 OCR 兜底: %s", exc)
+            text = self._ocr_fallback_image(image_path)
+            source_type = "image_ocr_fallback"
+        text = self._strip_code_fence(text).strip()
+        if not text:
+            raise ValueError(f"未能从截图提取有效需求文本: {image_path}")
+        return text, source_type
+
+    def recognize_intent_from_text(
+        self,
+        requirement_text: str,
+        supplemental_path: Optional[str] = None,
+        require_github: bool = True,
+    ) -> Dict[str, Any]:
+        """从需求文本做意图识别, 返回结构化 intent 字典。"""
+        supplemental = ""
+        if supplemental_path and os.path.isfile(supplemental_path):
+            supplemental = (
+                "\n\n== 补充材料 ==\n"
+                + Path(supplemental_path).read_text(encoding="utf-8", errors="replace")
+            )
+
+        user_prompt = (
+            "== 需求文档 ==\n" + requirement_text + supplemental +
+            "\n\n请据此输出意图识别 JSON。"
+        )
+        logger.info("[意图] 调用 DeepSeek 进行意图识别 ...")
+        raw = self._strip_code_fence(self._call_llm(_INTENT_PROMPT, user_prompt, temperature=0.1))
+        try:
+            intent = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"意图识别返回非法 JSON: {exc}\n原始返回:\n{raw[:500]}") from exc
+
+        if require_github and not intent.get("github_queries"):
+            raise RuntimeError("意图识别未产出 github_queries, 无法搜索开源项目。")
+        if not intent.get("search_queries"):
+            intent["search_queries"] = intent.get("keywords", [])[:3]
+
+        intent_path = self.references_dir / "intent.json"
+        intent_path.write_text(json.dumps(intent, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.info("[意图] task_summary: %s", intent.get("task_summary"))
+        return intent
+
+    def organize_local_project(self, project_path: str) -> Dict[str, Any]:
+        """闭源分支: 整理本地项目路径与基本信息。"""
+        root = Path(project_path).resolve()
+        if not root.exists():
+            raise FileNotFoundError(f"本地项目路径不存在: {project_path}")
+        if not root.is_dir():
+            raise ValueError(f"本地项目路径不是目录: {project_path}")
+
+        project = {
+            "project_type": "closed_source",
+            "full_name": root.name,
+            "url": None,
+            "stars": 0,
+            "description": f"本地项目: {root}",
+            "local_path": str(root),
+        }
+        logger.info("[闭源] 已整理本地项目: %s", root)
+        return project
+
+    def find_project(
+        self,
+        intent: Dict[str, Any],
+        local_project_path: Optional[str] = None,
+        max_repos: int = 1,
+    ) -> Dict[str, Any]:
+        """
+        寻找项目: 优先使用本地路径(闭源), 否则搜索并拉取开源仓库。
+        """
+        if local_project_path:
+            return self.organize_local_project(local_project_path)
+
+        repos = self.search_projects(intent, max_repos=max_repos)
+        fetched = self.fetch_project_code(repos)
+        valid = [r for r in fetched if r.get("local_path")]
+        if not valid:
+            raise RuntimeError("未找到可用的开源项目 (搜索或克隆失败)。")
+
+        primary = valid[0]
+        primary["project_type"] = "open_source"
+        logger.info("[寻找项目] 选定开源项目: %s", primary.get("full_name"))
+        return primary
+
+    def load_project_code(self, project: Dict[str, Any]) -> Dict[str, Any]:
+        """深入加载项目: 目录树、README、依赖文件、入口与关键源码。"""
+        local_path = project.get("local_path")
+        if not local_path or not os.path.isdir(local_path):
+            raise RuntimeError("项目 local_path 无效, 无法加载代码。")
+
+        root = Path(local_path)
+        read_paths: List[str] = []
+        dependency_files: Dict[str, str] = {}
+        key_files: Dict[str, str] = {}
+
+        readme = self._read_readme(local_path)
+        if readme != "(该仓库未找到可读的 README)":
+            read_paths.append(str(root / "README*"))
+
+        tree = self._list_tree(local_path, max_entries=80)
+        for fname in _DEPENDENCY_FILENAMES:
+            fpath = root / fname
+            if fpath.is_file():
+                content = fpath.read_text(encoding="utf-8", errors="replace")
+                dependency_files[fname] = content[: self._MAX_KEY_FILE_BYTES]
+                read_paths.append(str(fpath))
+
+        for entry_name in _ENTRY_CANDIDATES:
+            fpath = root / entry_name
+            if fpath.is_file():
+                content = fpath.read_text(encoding="utf-8", errors="replace")
+                key_files[entry_name] = content[: self._MAX_KEY_FILE_BYTES]
+                read_paths.append(str(fpath))
+
+        for rel in self._discover_key_source_files(root):
+            fpath = root / rel
+            if str(fpath) in read_paths:
+                continue
+            try:
+                content = fpath.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            key_files[rel] = content[: self._MAX_KEY_FILE_BYTES]
+            read_paths.append(str(fpath))
+            if len(key_files) >= self._MAX_KEY_FILES:
+                break
+
+        context = {
+            "project": project,
+            "local_path": local_path,
+            "readme": readme[:4000],
+            "tree": tree,
+            "dependency_files": dependency_files,
+            "key_files": key_files,
+            "read_paths": read_paths,
+        }
+        ctx_path = self.reports_dir / "project_context.json"
+        ctx_path.write_text(
+            json.dumps({**context, "key_files": list(key_files.keys())}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        logger.info("[加载代码] 已阅读 %d 个路径", len(read_paths))
+        return context
+
+    def _discover_key_source_files(self, root: Path) -> List[str]:
+        """发现值得阅读的关键源码文件 (优先 src/ 与顶层 .py)。"""
+        ignore = {".git", "__pycache__", "node_modules", ".venv", "venv", "dist", "build"}
+        candidates: List[str] = []
+        for pattern in ("src/**/*.py", "**/*.py"):
+            for fpath in root.glob(pattern):
+                if any(part in ignore for part in fpath.parts):
+                    continue
+                if fpath.name.startswith("test_") or fpath.name.endswith("_test.py"):
+                    continue
+                rel = str(fpath.relative_to(root))
+                if rel in candidates:
+                    continue
+                candidates.append(rel)
+                if len(candidates) >= self._MAX_KEY_FILES:
+                    return candidates
+        return candidates
+
+    def extract_dependencies(self, project_path: str) -> List[str]:
+        """从依赖清单与 Python import 中提取开源软件名称。"""
+        root = Path(project_path)
+        deps: set = set()
+
+        req = root / "requirements.txt"
+        if req.is_file():
+            for line in req.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                name = re.split(r"[<>=!~\[]", line)[0].strip()
+                if name:
+                    deps.add(name)
+
+        pyproject = root / "pyproject.toml"
+        if pyproject.is_file():
+            for match in re.finditer(r'["\']([a-zA-Z0-9_-]+)["\']', pyproject.read_text(encoding="utf-8", errors="replace")):
+                val = match.group(1)
+                if val not in {"dependencies", "dev-dependencies", "optional-dependencies"}:
+                    deps.add(val)
+
+        pkg = root / "package.json"
+        if pkg.is_file():
+            try:
+                data = json.loads(pkg.read_text(encoding="utf-8", errors="replace"))
+                for section in ("dependencies", "devDependencies"):
+                    for name in (data.get(section) or {}):
+                        deps.add(name)
+            except json.JSONDecodeError:
+                pass
+
+        import_re = re.compile(r"^\s*(?:from|import)\s+([a-zA-Z0-9_\.]+)")
+        for py_file in list(root.glob("**/*.py"))[:30]:
+            if ".venv" in py_file.parts or "venv" in py_file.parts:
+                continue
+            try:
+                for line in py_file.read_text(encoding="utf-8", errors="replace").splitlines():
+                    m = import_re.match(line)
+                    if m:
+                        deps.add(m.group(1).split(".")[0])
+            except OSError:
+                continue
+
+        stdlib = {"os", "sys", "json", "re", "pathlib", "typing", "datetime", "logging", "time", "math"}
+        return sorted(d for d in deps if d and d not in stdlib)
+
+    def fetch_online_discussions(
+        self, intent: Dict[str, Any], max_results: int = 5
+    ) -> List[Dict[str, str]]:
+        """检索网上正在讨论的相关话题。"""
+        if DDGS is None:
+            logger.warning("未安装 duckduckgo-search, 跳过网上讨论检索。")
+            return []
+
+        queries = intent.get("search_queries") or intent.get("keywords", [])[:3]
+        results: List[Dict[str, str]] = []
+        seen_urls: set = set()
+
+        try:
+            with DDGS() as ddgs:
+                for q in queries:
+                    logger.info("[讨论] 搜索: %s", q)
+                    try:
+                        rows = list(ddgs.text(q, max_results=max_results))
+                    except Exception as exc:
+                        logger.warning("[讨论] 查询失败, 跳过: %s | %s", q, exc)
+                        continue
+                    for row in rows:
+                        url = row.get("href") or row.get("link") or ""
+                        if not url or url in seen_urls:
+                            continue
+                        seen_urls.add(url)
+                        results.append({
+                            "query": q,
+                            "title": row.get("title") or "",
+                            "url": url,
+                            "snippet": row.get("body") or row.get("snippet") or "",
+                        })
+        except Exception as exc:
+            logger.warning("网上讨论检索异常: %s", exc)
+
+        disc_path = self.reports_dir / "online_discussions.json"
+        disc_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.info("[讨论] 收集 %d 条结果", len(results))
+        return results
+
+    def build_stage_prompt(
+        self,
+        requirement_text: str,
+        intent: Dict[str, Any],
+        project_context: Dict[str, Any],
+        dependencies: List[str],
+        discussions: List[Dict[str, str]],
+        history_prompt: Optional[str] = None,
+    ) -> str:
+        """生成当前阶段提示词, 可续接历史上下文。"""
+        history_block = ""
+        if history_prompt:
+            history_block = f"\n\n== 历史提示词(可续接) ==\n{history_prompt}\n"
+
+        discussion_block = "\n".join(
+            f"- [{d.get('title')}] {d.get('url')}\n  {d.get('snippet', '')[:200]}"
+            for d in discussions[:8]
+        ) or "(未检索到外部讨论)"
+
+        key_file_names = list(project_context.get("key_files", {}).keys())
+        prompt = (
+            f"任务: {intent.get('task_summary', '')}\n"
+            f"领域: {intent.get('domain', '')}\n"
+            f"项目路径: {project_context.get('local_path', '')}\n"
+            f"项目类型: {project_context.get('project', {}).get('project_type', '')}\n"
+            f"已阅读路径数: {len(project_context.get('read_paths', []))}\n"
+            f"关键文件: {', '.join(key_file_names) or '(无)'}\n"
+            f"开源依赖: {', '.join(dependencies[:20]) or '(未识别)'}\n"
+            f"外部讨论摘要:\n{discussion_block}\n"
+            f"{history_block}\n"
+            "请基于以上上下文, 继续深入阅读代码并完善项目逻辑理解。"
+        )
+        prompt_path = self.reports_dir / "stage_prompt.txt"
+        prompt_path.write_text(prompt, encoding="utf-8")
+        return prompt
+
+    def refine_project_context(
+        self,
+        requirement_text: str,
+        project_context: Dict[str, Any],
+        history_prompt: Optional[str] = None,
+    ) -> str:
+        """闭环整理项目流程与信息。"""
+        history_block = ""
+        if history_prompt:
+            history_block = f"\n\n== 历史上下文 ==\n{history_prompt}\n"
+
+        key_blocks = []
+        for name, content in project_context.get("key_files", {}).items():
+            key_blocks.append(f"### 文件: {name}\n```\n{content[:2000]}\n```")
+
+        dep_blocks = []
+        for name, content in project_context.get("dependency_files", {}).items():
+            dep_blocks.append(f"### {name}\n```\n{content[:1500]}\n```")
+
+        user_prompt = (
+            "== 需求文档 ==\n" + requirement_text[:3000] +
+            "\n\n== 目录结构 ==\n" + project_context.get("tree", "") +
+            "\n\n== README ==\n" + project_context.get("readme", "")[:3000] +
+            "\n\n== 依赖文件 ==\n" + "\n".join(dep_blocks) +
+            "\n\n== 关键源码 ==\n" + "\n\n".join(key_blocks) +
+            "\n\n== 已阅读路径 ==\n" + "\n".join(project_context.get("read_paths", [])) +
+            history_block
+        )
+        logger.info("[闭环] 整理项目流程与信息 ...")
+        refined = self._call_llm(_REFINE_CONTEXT_PROMPT, user_prompt, temperature=0.3)
+        refined_path = self.reports_dir / "refined_context.md"
+        refined_path.write_text(refined + "\n", encoding="utf-8")
+        return refined
+
+    def generate_action_report(
+        self,
+        requirement_text: str,
+        intent: Dict[str, Any],
+        project: Dict[str, Any],
+        project_context: Dict[str, Any],
+        dependencies: List[str],
+        discussions: List[Dict[str, str]],
+        refined_context: str,
+        stage_prompt: str,
+    ) -> str:
+        """生成最终行动报告 .md (含开源软件、网上讨论、逻辑、阶段提示词)。"""
+        discussion_text = "\n".join(
+            f"- **{d.get('title', '无标题')}** ({d.get('url', '')})\n  {d.get('snippet', '')}"
+            for d in discussions
+        ) or "- 未检索到相关外部讨论 (可安装 duckduckgo-search 或检查网络)"
+
+        user_prompt = (
+            "== 需求文档 ==\n" + requirement_text[:3000] +
+            "\n\n== 意图识别 ==\n" + json.dumps(intent, ensure_ascii=False, indent=2) +
+            "\n\n== 项目信息 ==\n" + json.dumps(project, ensure_ascii=False, indent=2) +
+            "\n\n== 已阅读路径 ==\n" + "\n".join(project_context.get("read_paths", [])) +
+            "\n\n== 识别到的开源软件 ==\n" + "\n".join(f"- {d}" for d in dependencies) +
+            "\n\n== 网上讨论(raw) ==\n" + discussion_text +
+            "\n\n== 闭环整理结果 ==\n" + refined_context +
+            "\n\n== 阶段提示词 ==\n" + stage_prompt
+        )
+
+        logger.info("[报告] 生成行动报告 ...")
+        body = self._call_llm(_ACTION_REPORT_PROMPT, user_prompt, temperature=0.3)
+        report_path = self.reports_dir / "action_report.md"
+        header = (
+            "# 项目行动报告\n\n"
+            f"> 生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"> 项目: {project.get('full_name', '')} ({project.get('project_type', '')})\n"
+            f"> 路径: {project.get('local_path', '')}\n\n"
+        )
+        report_path.write_text(header + body + "\n", encoding="utf-8")
+        logger.info("[报告] 已保存: %s", report_path)
+        return str(report_path)
+
+    def run_analysis_pipeline(
+        self,
+        requirement_path: str,
+        local_project_path: Optional[str] = None,
+        supplemental_path: Optional[str] = None,
+        history_prompt: Optional[str] = None,
+        max_repos: int = 1,
+    ) -> Dict[str, Any]:
+        """
+        项目分析主控管线 (单步、出错即停):
+          1. parse_requirement      需求表格/文档/截图视觉识别
+          2. recognize_intent       意图识别
+          3. find_project           寻找项目 (开源/闭源)
+          4. load_project_code      加载当前代码
+          5. extract_dependencies   提取开源软件名称
+          6. fetch_online_discussions 检索网上讨论
+          7. refine_project_context 闭环整理项目信息
+          8. build_stage_prompt     生成阶段提示词
+          9. generate_action_report 输出行动报告 .md
+        """
+        logger.info("########## 项目分析管线启动 ##########")
+
+        try:
+            parsed = self.parse_requirement(requirement_path)
+        except Exception as exc:
+            logger.error("需求解析失败: %s", exc)
+            return {"status": "FAILED", "stage": "parse_requirement", "error": str(exc)}
+
+        requirement_text = parsed["text"]
+
+        try:
+            intent = self.recognize_intent_from_text(
+                requirement_text,
+                supplemental_path=supplemental_path,
+                require_github=not bool(local_project_path),
+            )
+        except Exception as exc:
+            logger.error("意图识别失败: %s", exc)
+            return {"status": "FAILED", "stage": "recognize_intent", "error": str(exc), "requirement": parsed}
+
+        try:
+            project = self.find_project(intent, local_project_path=local_project_path, max_repos=max_repos)
+        except Exception as exc:
+            logger.error("寻找项目失败: %s", exc)
+            return {"status": "FAILED", "stage": "find_project", "error": str(exc), "intent": intent}
+
+        try:
+            project_context = self.load_project_code(project)
+        except Exception as exc:
+            logger.error("加载代码失败: %s", exc)
+            return {"status": "FAILED", "stage": "load_project_code", "error": str(exc), "project": project}
+
+        try:
+            dependencies = self.extract_dependencies(project["local_path"])
+        except Exception as exc:
+            logger.error("依赖提取失败: %s", exc)
+            return {"status": "FAILED", "stage": "extract_dependencies", "error": str(exc), "project": project}
+
+        try:
+            discussions = self.fetch_online_discussions(intent)
+        except Exception as exc:
+            logger.error("网上讨论检索失败: %s", exc)
+            discussions = []
+
+        try:
+            refined_context = self.refine_project_context(
+                requirement_text, project_context, history_prompt=history_prompt
+            )
+        except Exception as exc:
+            logger.error("闭环整理失败: %s", exc)
+            return {"status": "FAILED", "stage": "refine_project_context", "error": str(exc), "project": project}
+
+        try:
+            stage_prompt = self.build_stage_prompt(
+                requirement_text, intent, project_context, dependencies, discussions, history_prompt
+            )
+        except Exception as exc:
+            logger.error("阶段提示词生成失败: %s", exc)
+            return {"status": "FAILED", "stage": "build_stage_prompt", "error": str(exc), "project": project}
+
+        try:
+            report_path = self.generate_action_report(
+                requirement_text, intent, project, project_context,
+                dependencies, discussions, refined_context, stage_prompt,
+            )
+        except Exception as exc:
+            logger.error("行动报告生成失败: %s", exc)
+            return {"status": "FAILED", "stage": "generate_action_report", "error": str(exc), "project": project}
+
+        result = {
+            "status": "SUCCESS",
+            "requirement": parsed,
+            "intent": intent,
+            "project": project,
+            "dependencies": dependencies,
+            "discussions_count": len(discussions),
+            "read_paths": project_context.get("read_paths", []),
+            "refined_context_path": str(self.reports_dir / "refined_context.md"),
+            "stage_prompt_path": str(self.reports_dir / "stage_prompt.txt"),
+            "report_path": report_path,
+            "llm_usage": dict(self._last_llm_usage),
+        }
+        logger.info("########## 项目分析完成: %s ##########", report_path)
+        return result
+
     # ------------------------------------------------------------------ #
-    # 1) 代码生成
+    # 1) 代码生成 (遗留实验管线)
     # ------------------------------------------------------------------ #
     def generate_script(self, blueprint_path: str, research_md_path: str) -> str:
         """
@@ -224,7 +1130,6 @@ class CodeSandbox:
         except FileNotFoundError as exc:
             raise FileNotFoundError(f"文献报告不存在: {research_md_path}") from exc
 
-        system_prompt = _SYSTEM_PROMPT_TEMPLATE.format(data_dir=str(self.data_dir))
         user_prompt = (
             "== 策略蓝图 (blueprint.json) ==\n"
             f"{json.dumps(blueprint, ensure_ascii=False, indent=2)}\n\n"
@@ -233,25 +1138,16 @@ class CodeSandbox:
             "请据此生成完整可运行的 Python 实验脚本。"
         )
 
-        logger.info("[生成] 调用 DeepSeek 模型: %s ...", self.model)
-        client = self._get_client()
-        try:
-            resp = client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
+        logger.info("[生成] 调用文本模型链 (主模型: %s/%s) ...", self._text_primary_ref[0], self.model)
+        code = self._strip_code_fence(
+            self._call_llm(
+                _SYSTEM_PROMPT_TEMPLATE.format(data_dir=str(self.data_dir)),
+                user_prompt,
                 temperature=0.2,
-                stream=False,
             )
-        except Exception as exc:  # openai 各类网络/鉴权异常统一兜底
-            raise RuntimeError(f"DeepSeek API 调用失败: {exc}") from exc
-
-        code = resp.choices[0].message.content or ""
-        code = self._strip_code_fence(code)
+        )
         if not code.strip():
-            raise RuntimeError("DeepSeek 返回空代码, 请检查蓝图/报告内容或 API 配额。")
+            raise RuntimeError("模型返回空代码, 请检查蓝图/报告内容或 API 配额。")
 
         script_path = self.src_dir / "baseline_v1.py"
         with open(script_path, "w", encoding="utf-8") as f:
@@ -271,9 +1167,7 @@ class CodeSandbox:
     ) -> Dict[str, Any]:
         """
         读取研究报告 (可选蓝图), 调用 DeepSeek 做意图识别, 返回结构化意图字典。
-
-        返回示例:
-          {"task_summary", "domain", "frameworks", "keywords", "github_queries"}
+        兼容旧接口; 新管线请使用 recognize_intent_from_text / run_analysis_pipeline。
         """
         logger.info("[意图] 读取研究报告: %s", research_md_path)
         try:
@@ -282,54 +1176,8 @@ class CodeSandbox:
         except FileNotFoundError as exc:
             raise FileNotFoundError(f"研究报告不存在: {research_md_path}") from exc
 
-        blueprint_ctx = ""
-        if blueprint_path and os.path.isfile(blueprint_path):
-            try:
-                with open(blueprint_path, "r", encoding="utf-8") as f:
-                    blueprint_ctx = "\n\n== 策略蓝图(可选参考) ==\n" + f.read()
-            except OSError:
-                pass
-
-        user_prompt = (
-            "== 研究报告(Markdown) ==\n" + research_md + blueprint_ctx +
-            "\n\n请据此输出意图识别 JSON。"
-        )
-
-        logger.info("[意图] 调用 DeepSeek 进行意图识别 ...")
-        client = self._get_client()
-        try:
-            resp = client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": _INTENT_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.1,
-                stream=False,
-            )
-        except Exception as exc:
-            raise RuntimeError(f"DeepSeek 意图识别调用失败: {exc}") from exc
-
-        raw = self._strip_code_fence(resp.choices[0].message.content or "")
-        try:
-            intent = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"意图识别返回非法 JSON: {exc}\n原始返回:\n{raw[:500]}") from exc
-
-        if not intent.get("github_queries"):
-            raise RuntimeError("意图识别未产出任何 github_queries, 无法继续搜索。")
-
-        logger.info("[意图] task_summary: %s", intent.get("task_summary"))
-        logger.info("[意图] domain=%s | frameworks=%s", intent.get("domain"), intent.get("frameworks"))
-        logger.info("[意图] github_queries=%s", intent.get("github_queries"))
-
-        # 落盘意图, 便于人工审阅
-        try:
-            with open(self.references_dir / "intent.json", "w", encoding="utf-8") as f:
-                json.dump(intent, f, ensure_ascii=False, indent=2)
-        except OSError as exc:
-            logger.warning("意图 JSON 落盘失败: %s", exc)
-        return intent
+        supplemental = blueprint_path if blueprint_path and os.path.isfile(blueprint_path) else None
+        return self.recognize_intent_from_text(research_md, supplemental_path=supplemental, require_github=True)
 
     # ---- 2) 搜索合适的开源项目 ----
     def search_projects(self, intent: Dict[str, Any], max_repos: int = 3) -> list:
@@ -466,22 +1314,8 @@ class CodeSandbox:
             "\n\n请输出设计对齐与可参考点的 Markdown 报告。"
         )
 
-        logger.info("[对齐] 调用 DeepSeek 生成设计对齐报告 ...")
-        client = self._get_client()
-        try:
-            resp = client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": _ALIGN_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.3,
-                stream=False,
-            )
-        except Exception as exc:
-            raise RuntimeError(f"DeepSeek 设计对齐调用失败: {exc}") from exc
-
-        report = resp.choices[0].message.content or ""
+        logger.info("[对齐] 调用文本模型链生成设计对齐报告 ...")
+        report = self._call_llm(_ALIGN_PROMPT, user_prompt, temperature=0.3)
         report_path = self.references_dir / "reference_report.md"
         header = (
             "# 参考项目设计对齐报告\n\n"
@@ -950,34 +1784,30 @@ class CodeSandbox:
 # 使用示例 (直接运行本文件时的最小演示)
 # =============================================================================
 if __name__ == "__main__":
-    WORKSPACE = "/Volumes/MySSD/Kaggle_Agent/"
-
-    # 远程算力(可选): 不需要远程时置为 None
-    SSH_CONFIG = {
-        "host": "your.server.ip",
-        "user": "ubuntu",
-        "port": 22,
-        "key_filepath": os.path.expanduser("~/.ssh/id_rsa"),
-        # "remote_workspace": "/home/ubuntu/Kaggle_Agent",  # 可选覆盖
-    }
-
-    sandbox = CodeSandbox(
-        workspace_path=WORKSPACE,
-        ssh_config=None,  # 示例默认仅本地; 需要远程时传入 SSH_CONFIG
+    WORKSPACE = os.environ.get(
+        "KAGGLE_AGENT_WORKSPACE",
+        str(Path(__file__).resolve().parent / "kaggle_agent_workspace"),
     )
 
-    blueprint = os.path.join(WORKSPACE, "blueprint.json")
-    research = os.path.join(WORKSPACE, "research_report.md")
+    sandbox = CodeSandbox(workspace_path=WORKSPACE, ssh_config=None)
 
-    # ---- 功能A: 参考项目挖掘 (意图识别 -> 搜索 -> 拉取 -> 设计对齐) ----
-    refs = sandbox.discover_references(research, blueprint, max_repos=3)
-    print("\n参考项目挖掘结果:")
+    examples_dir = Path(__file__).resolve().parent / "examples"
+    requirement = os.environ.get(
+        "REQUIREMENT_PATH",
+        str(examples_dir / "requirement_table.md"),
+    )
+    local_project = os.environ.get("LOCAL_PROJECT_PATH")
+
+    result = sandbox.run_analysis_pipeline(
+        requirement_path=requirement,
+        local_project_path=local_project,
+        supplemental_path=str(examples_dir / "blueprint.json") if (examples_dir / "blueprint.json").exists() else None,
+    )
+    print("\n项目分析结果:")
     print(json.dumps(
-        {k: v for k, v in refs.items() if k != "intent"},
-        ensure_ascii=False, indent=2,
+        {k: v for k, v in result.items() if k not in ("intent",)},
+        ensure_ascii=False,
+        indent=2,
     ))
-
-    # ---- 功能B: 生成并执行实验 ----
-    final = sandbox.run_experiment(blueprint, research)
-    print("\n最终执行状态:")
-    print(json.dumps(final, ensure_ascii=False, indent=2))
+    if result.get("status") == "SUCCESS":
+        print(f"\n行动报告: {result.get('report_path')}")
